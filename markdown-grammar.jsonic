@@ -1,0 +1,62 @@
+# Markdown Grammar Definition
+# Parsed by a standard Jsonic instance and passed to jsonic.grammar()
+# Function references (@ prefixed) are resolved against the refs map
+#
+# The custom line-scanning lexer (see buildMarkdownLineMatcher in src/markdown.ts)
+# emits one token per markdown line, classified by block type:
+#
+#   #MH - heading line       val: { level, text }
+#   #MR - horizontal rule    val: null
+#   #MC - fenced code block  val: { lang, text }
+#   #ML - list item line     val: { ordered, text }
+#   #MQ - blockquote line    val: string
+#   #MT - plain text line    val: string
+#   #MB - blank line         val: null
+#   #ZZ - end of input       (built-in)
+#
+# The grammar then groups adjacent same-type tokens into block structures:
+#   consecutive #MT  -> paragraph (lines joined with \n)
+#   consecutive #ML  -> list      (items accumulated)
+#   consecutive #MQ  -> blockquote (lines joined with \n)
+# Standalone block tokens (#MH, #MR, #MC) form single blocks.
+
+{
+  rule: md: open: [
+    { s: '#ZZ' g: 'md,empty' }
+    { p: blocks g: 'md,content' }
+  ]
+
+  rule: blocks: open: [
+    { s: '#ZZ' g: 'md,blocks,end' }
+    { p: block g: 'md,blocks,push' }
+  ]
+  rule: blocks: close: [
+    { s: '#ZZ' g: 'md,blocks,end' }
+    { r: blocks g: 'md,blocks,more' }
+  ]
+
+  rule: block: open: [
+    { s: '#MB' g: 'md,blank' }
+    { s: '#MH' a: '@heading'    g: 'md,heading' }
+    { s: '#MR' a: '@hr'         g: 'md,hr' }
+    { s: '#MC' a: '@code'       g: 'md,code' }
+    { s: '#ML' a: '@list-start' p: list-tail  g: 'md,list' }
+    { s: '#MQ' a: '@quote-start' p: quote-tail g: 'md,quote' }
+    { s: '#MT' a: '@para-start' p: para-tail  g: 'md,para' }
+  ]
+
+  rule: para-tail: open: [
+    { s: '#MT' a: '@para-append' r: para-tail g: 'md,para,more' }
+    { g: 'md,para,end' }
+  ]
+
+  rule: list-tail: open: [
+    { s: '#ML' a: '@list-append' r: list-tail g: 'md,list,more' }
+    { g: 'md,list,end' }
+  ]
+
+  rule: quote-tail: open: [
+    { s: '#MQ' a: '@quote-append' r: quote-tail g: 'md,quote,more' }
+    { g: 'md,quote,end' }
+  ]
+}

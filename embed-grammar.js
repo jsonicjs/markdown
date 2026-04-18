@@ -1,27 +1,52 @@
 #!/usr/bin/env node
 
-// Embed csv-grammar.jsonic into TypeScript and Go source files.
+// Embed grammar definitions into TypeScript and Go source files.
 // Run via: npm run embed  (or:  node embed-grammar.js)
+//
+// Each entry in TARGETS points a grammar source file at one or more output
+// files. Each output declares the marker pair that brackets the embedded
+// grammar block so that this script can replace it in place.
 
 const fs = require('fs')
 const path = require('path')
 
-const GRAMMAR_FILE = path.join(__dirname, 'csv-grammar.jsonic')
-const TS_FILE = path.join(__dirname, 'src', 'csv.ts')
-const GO_FILE = path.join(__dirname, 'go', 'csv.go')
+const TARGETS = [
+  {
+    grammar: path.join(__dirname, 'csv-grammar.jsonic'),
+    outputs: [
+      {
+        file: path.join(__dirname, 'src', 'csv.ts'),
+        kind: 'ts',
+        begin: '// --- BEGIN EMBEDDED csv-grammar.jsonic ---',
+        end: '// --- END EMBEDDED csv-grammar.jsonic ---',
+      },
+      {
+        file: path.join(__dirname, 'go', 'csv.go'),
+        kind: 'go',
+        begin: '// --- BEGIN EMBEDDED csv-grammar.jsonic ---',
+        end: '// --- END EMBEDDED csv-grammar.jsonic ---',
+      },
+    ],
+  },
+  {
+    grammar: path.join(__dirname, 'markdown-grammar.jsonic'),
+    outputs: [
+      {
+        file: path.join(__dirname, 'src', 'markdown.ts'),
+        kind: 'ts',
+        begin: '// --- BEGIN EMBEDDED markdown-grammar.jsonic ---',
+        end: '// --- END EMBEDDED markdown-grammar.jsonic ---',
+      },
+    ],
+  },
+]
 
-const BEGIN = '// --- BEGIN EMBEDDED csv-grammar.jsonic ---'
-const END = '// --- END EMBEDDED csv-grammar.jsonic ---'
-
-const grammar = fs.readFileSync(GRAMMAR_FILE, 'utf8')
-
-// --- TypeScript embedding ---
-function embedTS() {
-  let src = fs.readFileSync(TS_FILE, 'utf8')
-  const startIdx = src.indexOf(BEGIN)
-  const endIdx = src.indexOf(END)
+function embedTS(grammar, output) {
+  let src = fs.readFileSync(output.file, 'utf8')
+  const startIdx = src.indexOf(output.begin)
+  const endIdx = src.indexOf(output.end)
   if (startIdx === -1 || endIdx === -1) {
-    console.error('TS markers not found in', TS_FILE)
+    console.error('TS markers not found in', output.file)
     process.exit(1)
   }
 
@@ -32,24 +57,23 @@ function embedTS() {
     .replace(/\$\{/g, '\\${')
 
   const replacement =
-    BEGIN +
+    output.begin +
     '\nconst grammarText = `\n' +
     escaped +
     '`\n' +
-    END
+    output.end
 
-  src = src.substring(0, startIdx) + replacement + src.substring(endIdx + END.length)
-  fs.writeFileSync(TS_FILE, src)
-  console.log('Embedded grammar into', TS_FILE)
+  src = src.substring(0, startIdx) + replacement + src.substring(endIdx + output.end.length)
+  fs.writeFileSync(output.file, src)
+  console.log('Embedded grammar into', output.file)
 }
 
-// --- Go embedding ---
-function embedGo() {
-  let src = fs.readFileSync(GO_FILE, 'utf8')
-  const startIdx = src.indexOf(BEGIN)
-  const endIdx = src.indexOf(END)
+function embedGo(grammar, output) {
+  let src = fs.readFileSync(output.file, 'utf8')
+  const startIdx = src.indexOf(output.begin)
+  const endIdx = src.indexOf(output.end)
   if (startIdx === -1 || endIdx === -1) {
-    console.error('Go markers not found in', GO_FILE)
+    console.error('Go markers not found in', output.file)
     process.exit(1)
   }
 
@@ -59,16 +83,27 @@ function embedGo() {
   }
 
   const replacement =
-    BEGIN +
+    output.begin +
     '\nconst grammarText = `\n' +
     grammar +
     '`\n' +
-    END
+    output.end
 
-  src = src.substring(0, startIdx) + replacement + src.substring(endIdx + END.length)
-  fs.writeFileSync(GO_FILE, src)
-  console.log('Embedded grammar into', GO_FILE)
+  src = src.substring(0, startIdx) + replacement + src.substring(endIdx + output.end.length)
+  fs.writeFileSync(output.file, src)
+  console.log('Embedded grammar into', output.file)
 }
 
-embedTS()
-embedGo()
+for (const target of TARGETS) {
+  const grammar = fs.readFileSync(target.grammar, 'utf8')
+  for (const output of target.outputs) {
+    if (output.kind === 'ts') {
+      embedTS(grammar, output)
+    } else if (output.kind === 'go') {
+      embedGo(grammar, output)
+    } else {
+      console.error('Unknown embed kind:', output.kind)
+      process.exit(1)
+    }
+  }
+}
