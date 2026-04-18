@@ -37,6 +37,12 @@ const TARGETS = [
         begin: '// --- BEGIN EMBEDDED markdown-grammar.jsonic ---',
         end: '// --- END EMBEDDED markdown-grammar.jsonic ---',
       },
+      {
+        file: path.join(__dirname, 'go', 'markdown', 'markdown.go'),
+        kind: 'go',
+        begin: '// --- BEGIN EMBEDDED markdown-grammar.jsonic ---',
+        end: '// --- END EMBEDDED markdown-grammar.jsonic ---',
+      },
     ],
   },
 ]

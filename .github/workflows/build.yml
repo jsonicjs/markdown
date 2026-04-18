@@ -7,7 +7,8 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build-ts:
+    name: TypeScript (csv + markdown)
 
     strategy:
       fail-fast: false
@@ -18,16 +19,24 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
-    - run: npm i
-    - run: npm run build --if-present
-    - run: npm test
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Install dependencies
+        run: npm ci || npm i
+      - name: Embed grammars
+        run: node embed-grammar.js
+      - name: Build (csv + markdown)
+        run: npm run build --if-present
+      - name: Test csv
+        run: node --enable-source-maps --test dist-test/csv.test.js
+      - name: Test markdown
+        run: node --enable-source-maps --test dist-test/markdown.test.js
 
   build-go:
+    name: Go (csv + markdown)
 
     strategy:
       fail-fast: false
@@ -37,14 +46,20 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.24'
-    - name: Build
-      working-directory: go
-      run: go build ./...
-    - name: Test
-      working-directory: go
-      run: go test -v ./...
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Build (csv + markdown)
+        working-directory: go
+        run: go build ./...
+      - name: Vet (csv + markdown)
+        working-directory: go
+        run: go vet ./...
+      - name: Test csv
+        working-directory: go
+        run: go test -v .
+      - name: Test markdown
+        working-directory: go
+        run: go test -v ./markdown
