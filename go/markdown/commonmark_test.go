@@ -25,8 +25,8 @@ import (
 
 // minCommonMarkPasses is the regression floor. Bump upward as the parser
 // improves; never decrease without an explanation in the commit.
-// Current baseline: 611/652 (step 26: re-tokenize failed ref suffix).
-const minCommonMarkPasses = 606
+// Current baseline: 613/652 (step 27: shortcut lookahead full-ref).
+const minCommonMarkPasses = 608
 
 type commonMarkCase struct {
 	Markdown  string `json:"markdown"`

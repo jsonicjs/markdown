@@ -1875,6 +1875,35 @@ func decodeRune(s string, i int) (rune, int) {
 	return rune(b), 1
 }
 
+// scanFollowingBracketPair checks whether the segments at `start` form a
+// `[label]` or `[]` bracket pair and, if so, returns its inner-text label
+// (empty for `[]`) and the index of the closing bracket segment.
+func scanFollowingBracketPair(segs []*inlineSeg, start int) (string, int, bool) {
+	if start >= len(segs) {
+		return "", 0, false
+	}
+	open := segs[start]
+	if open.kind != segBracket || !open.open || open.image {
+		return "", 0, false
+	}
+	depth := 1
+	for j := start + 1; j < len(segs); j++ {
+		s := segs[j]
+		if s.kind == segBracket {
+			if s.open {
+				depth++
+			} else {
+				depth--
+				if depth == 0 {
+					inner := segs[start+1 : j]
+					return innerText(inner), j, true
+				}
+			}
+		}
+	}
+	return "", 0, false
+}
+
 // innerText extracts a best-effort plain-text rendering of a segment list,
 // used as alt text for images.
 func innerText(segs []*inlineSeg) string {
@@ -2245,20 +2274,43 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 
 		var url, title string
 		hasTarget := false
+		consumeThrough := i
 		if openIdx >= 0 {
-			if close.hasURL {
+			switch {
+			case close.hasURL:
 				url = close.url
 				title = close.title
 				hasTarget = true
-			} else if close.hasRef && refs != nil {
-				var label string
-				if close.refLabel != "" {
-					label = close.refLabel
-				} else if close.refCollapsed || close.refShortcut {
-					label = innerText(inner)
+			case close.refLabel != "" && refs != nil:
+				if ref, ok := refs[normalizeLinkLabel(close.refLabel)]; ok {
+					url = ref.URL
+					title = ref.Title
+					hasTarget = true
 				}
-				if label != "" {
-					if ref, ok := refs[normalizeLinkLabel(label)]; ok {
+			case close.refCollapsed && refs != nil:
+				if ref, ok := refs[normalizeLinkLabel(innerText(inner))]; ok {
+					url = ref.URL
+					title = ref.Title
+					hasTarget = true
+				}
+			case refs != nil:
+				// Shortcut candidate. If followed by `[label]` or `[]`,
+				// that's a full/collapsed ref attempt which wins over
+				// shortcut — even if the label doesn't resolve, the
+				// shortcut is NOT tried.
+				if label, endIdx, ok := scanFollowingBracketPair(segs, i+1); ok {
+					useLabel := label
+					if label == "" {
+						useLabel = innerText(inner)
+					}
+					if ref, ok2 := refs[normalizeLinkLabel(useLabel)]; ok2 {
+						url = ref.URL
+						title = ref.Title
+						hasTarget = true
+						consumeThrough = endIdx
+					}
+				} else {
+					if ref, ok := refs[normalizeLinkLabel(innerText(inner))]; ok {
 						url = ref.URL
 						title = ref.Title
 						hasTarget = true
@@ -2317,7 +2369,7 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 		}
 
 		replacement := &inlineSeg{kind: segHTML, value: html}
-		tail := append([]*inlineSeg{}, segs[i+1:]...)
+		tail := append([]*inlineSeg{}, segs[consumeThrough+1:]...)
 		segs = append(segs[:openIdx], append([]*inlineSeg{replacement}, tail...)...)
 
 		if !op.image {

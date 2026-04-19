@@ -1552,6 +1552,34 @@ function utf8Bytes(c: string): number[] {
   return out
 }
 
+// scanFollowingBracketPair checks whether the segments at `start` form a
+// `[label]` or `[]` bracket pair and, if so, returns its inner-text label
+// (empty for `[]`) and the index of the closing bracket segment.
+function scanFollowingBracketPair(
+  segs: InlineSeg[],
+  start: number,
+): { label: string; endIdx: number } | null {
+  if (start >= segs.length) return null
+  const open = segs[start]
+  if (open.kind !== 'bracket' || !open.open || open.image) return null
+  let depth = 1
+  for (let j = start + 1; j < segs.length; j++) {
+    const s = segs[j]
+    if (s.kind === 'bracket') {
+      if (s.open) {
+        depth++
+      } else {
+        depth--
+        if (depth === 0) {
+          const inner = segs.slice(start + 1, j)
+          return { label: innerText(inner), endIdx: j }
+        }
+      }
+    }
+  }
+  return null
+}
+
 // innerText extracts a best-effort plain-text rendering of a segment list,
 // used as alt text for images. Nested markup is stripped; a nested `<img>`
 // contributes its alt attribute.
@@ -1923,19 +1951,47 @@ function processLinks(
     // if we have a matching opener.
     let url: string | undefined
     let title: string | undefined
+    let consumeThrough = i // last segment index to remove when match forms
     if (openIdx >= 0) {
       if (close.url !== undefined) {
         url = close.url
         title = close.title
-      } else {
-        let label: string | undefined
-        if (close.refLabel) {
-          label = close.refLabel
-        } else if (close.refCollapsed || close.refShortcut) {
-          label = innerText(inner)
+      } else if (close.refLabel) {
+        // Full ref consumed by tokenizer. If it doesn't resolve, we
+        // re-split the suffix below so the `[label]` can still form its
+        // own link later.
+        const ref = refs[normalizeLinkLabel(close.refLabel)]
+        if (ref) {
+          url = ref.url
+          title = ref.title
         }
-        if (label !== undefined) {
+      } else if (close.refCollapsed) {
+        // Collapsed `[]` consumed by tokenizer; label is inner text.
+        const ref = refs[normalizeLinkLabel(innerText(inner))]
+        if (ref) {
+          url = ref.url
+          title = ref.title
+        }
+      } else {
+        // Shortcut candidate. Per CommonMark, if this `]` is followed by
+        // a `[label]` or `[]` bracket pair, that's a full/collapsed ref
+        // attempt which WINS over a shortcut attempt — even if the
+        // label doesn't resolve, the shortcut is NOT tried.
+        const la = scanFollowingBracketPair(segs, i + 1)
+        if (la) {
+          const label = la.label !== '' ? la.label : innerText(inner)
           const ref = refs[normalizeLinkLabel(label)]
+          if (ref) {
+            url = ref.url
+            title = ref.title
+            consumeThrough = la.endIdx
+          }
+          // If the full/collapsed ref attempt didn't resolve, leave
+          // url undefined — the outer `[text]` link fails and the
+          // enclosed `[label]` segments remain for their own pass.
+        } else {
+          // No follow-up: try shortcut with inner text as label.
+          const ref = refs[normalizeLinkLabel(innerText(inner))]
           if (ref) {
             url = ref.url
             title = ref.title
@@ -1990,7 +2046,7 @@ function processLinks(
       html = `<a href="${encodeLinkUrl(url)}"${titleAttr}>${inside}</a>`
     }
 
-    segs.splice(openIdx, i - openIdx + 1, {
+    segs.splice(openIdx, consumeThrough - openIdx + 1, {
       kind: 'html',
       value: html,
     })
