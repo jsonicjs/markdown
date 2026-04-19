@@ -410,13 +410,30 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 
 		// Lazy continuation of a blockquote paragraph is only allowed when
 		// the accumulated content doesn't already end with an empty line.
+		// Lazy continuation of a blockquote paragraph is only allowed when
+		// the accumulated content doesn't already end with an empty line.
 		"@quote-lazy-ok": jsonic.AltCond(func(r *jsonic.Rule, ctx *jsonic.Context) bool {
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
 			if cur == nil {
 				return true
 			}
 			text, _ := cur["text"].(string)
-			return !strings.HasSuffix(text, "\n")
+			if strings.HasSuffix(text, "\n") {
+				return false
+			}
+			// Lazy continuation only applies to an open paragraph. If
+			// the blockquote's last line itself opens a non-paragraph
+			// block (fenced code etc.) then a following line without
+			// `>` must terminate the quote (spec example 237).
+			lastNL := strings.LastIndex(text, "\n")
+			lastLine := text
+			if lastNL >= 0 {
+				lastLine = text[lastNL+1:]
+			}
+			if reQuoteFenceStart.MatchString(lastLine) {
+				return false
+			}
+			return true
 		}),
 
 		"@para-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -741,6 +758,7 @@ var (
 	reBlockquote        = regexp.MustCompile(`^ {0,3}>( ?)(.*)$`)
 	reOrderedFullStart1 = regexp.MustCompile(`^ {0,3}1[.)][ \t]`)
 	reLabelBlankLine    = regexp.MustCompile(`\n[ \t]*\n`)
+	reQuoteFenceStart   = regexp.MustCompile("^ {0,3}(?:`{3,}|~{3,})")
 )
 
 // computeListItem determines the effective content column and first-line

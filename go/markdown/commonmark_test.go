@@ -25,8 +25,8 @@ import (
 
 // minCommonMarkPasses is the regression floor. Bump upward as the parser
 // improves; never decrease without an explanation in the commit.
-// Current baseline: 647/652 (step 42: blockquote lazy MSX/MIC continuation).
-const minCommonMarkPasses = 644
+// Current baseline: 648/652 (step 43: fenced-code opener breaks quote lazy).
+const minCommonMarkPasses = 645
 
 type commonMarkCase struct {
 	Markdown  string `json:"markdown"`

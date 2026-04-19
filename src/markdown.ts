@@ -382,8 +382,17 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     // the blockquote's accumulated content does not already end with an
     // empty line (i.e. a prior `>` with no content ended the paragraph).
     '@quote-lazy-ok': (_r: Rule, ctx: Context) => {
-      const text = ctx.u.mdCurrent?.text ?? ''
-      return !/\n$/.test(text)
+      const text = (ctx.u.mdCurrent?.text ?? '') as string
+      if (/\n$/.test(text)) return false
+      // Lazy continuation only applies to an open paragraph. If the
+      // blockquote's last line itself opens a non-paragraph block
+      // (fenced code, ATX heading, thematic break, HTML block, etc.)
+      // then a following line without `>` must terminate the quote
+      // instead of lazily joining (spec example 237).
+      const lastNL = text.lastIndexOf('\n')
+      const lastLine = lastNL < 0 ? text : text.slice(lastNL + 1)
+      if (/^ {0,3}(?:`{3,}|~{3,})/.test(lastLine)) return false
+      return true
     },
 
     '@para-start': (r: Rule, ctx: Context) => {
