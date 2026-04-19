@@ -77,6 +77,7 @@ const grammarText = `
     { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,more' }
     { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,cont' }
     { s: '#MB'  a: '@list-blank'  r: list-tail-blank g: 'md,list,blank' }
+    { s: '#MT'  a: '@list-lazy'   r: list-tail g: 'md,list,lazy' }
     { g: 'md,list,end' }
   ]
 
@@ -286,6 +287,22 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			meta["listPendingBlank"] = true
 			cnt, _ := meta["listPendingBlanks"].(int)
 			meta["listPendingBlanks"] = cnt + 1
+		}),
+
+		// Lazy paragraph continuation: a plain text line inside list-tail
+		// attaches to the current item's text, matching CommonMark's
+		// paragraph-continuation-inside-list-item rule.
+		"@list-lazy": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			v, _ := r.O0.Val.(string)
+			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			items, _ := cur["items"].([]any)
+			last, _ := items[len(items)-1].(map[string]any)
+			text, _ := last["text"].(string)
+			if text == "" {
+				last["text"] = v
+			} else {
+				last["text"] = text + "\n" + v
+			}
 		}),
 
 		"@quote-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {

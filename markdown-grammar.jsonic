@@ -58,6 +58,7 @@
     { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,more' }
     { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,cont' }
     { s: '#MB'  a: '@list-blank'  r: list-tail-blank g: 'md,list,blank' }
+    { s: '#MT'  a: '@list-lazy'   r: list-tail g: 'md,list,lazy' }
     { g: 'md,list,end' }
   ]
 

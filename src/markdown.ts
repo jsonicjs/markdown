@@ -97,6 +97,7 @@ const grammarText = `
     { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,more' }
     { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,cont' }
     { s: '#MB'  a: '@list-blank'  r: list-tail-blank g: 'md,list,blank' }
+    { s: '#MT'  a: '@list-lazy'   r: list-tail g: 'md,list,lazy' }
     { g: 'md,list,end' }
   ]
 
@@ -281,6 +282,19 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       ctx.u.listPendingBlank = true
       ctx.u.listPendingBlanks =
         ((ctx.u.listPendingBlanks as number) || 0) + 1
+    },
+
+    // A plain #MT line inside list-tail is a lazy continuation of the
+    // current item's paragraph (the line was not indented enough to
+    // become an MLC). Append it to the last item's text; the sub-parse
+    // handles turning it into paragraph continuation content.
+    '@list-lazy': (r: Rule, ctx: Context) => {
+      const v = r.o0.val as string
+      const block = ctx.u.mdCurrent
+      const items = block.items
+      const last = items[items.length - 1]
+      if (last.text.length === 0) last.text = v
+      else last.text += '\n' + v
     },
 
 
