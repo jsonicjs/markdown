@@ -364,17 +364,24 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 		"@setext-promote": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(map[string]any)
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
-			// Strip leading link reference definitions from the
-			// paragraph text before forming the heading. If nothing
-			// remains, leave the block as a paragraph (it will likely
-			// be dropped later during ref extraction).
+			// Strip leading link reference definitions. Stash the
+			// extracted defs on the block itself as `_implicitRefDefs`
+			// so the document-level ref gathering picks them up even
+			// though the enclosing paragraph became a heading.
 			text, _ := cur["text"].(string)
+			var defs []map[string]string
 			for {
-				_, _, _, length, ok := parseLinkRefDef(text)
+				label, url, title, length, ok := parseLinkRefDef(text)
 				if !ok {
 					break
 				}
+				defs = append(defs, map[string]string{
+					"label": label, "url": url, "title": title,
+				})
 				text = text[length:]
+			}
+			if len(defs) > 0 {
+				cur["_implicitRefDefs"] = defs
 			}
 			text = strings.TrimSpace(text)
 			if text == "" {
@@ -2594,6 +2601,18 @@ func escapeHTMLString(s string) string {
 // are visible to the document as a whole.
 func GatherAllLinkRefs(blocks []any) LinkRefMap {
 	refs := LinkRefMap{}
+	absorb := func(b map[string]any) {
+		defs, _ := b["_implicitRefDefs"].([]map[string]string)
+		for _, d := range defs {
+			norm := normalizeLinkLabel(d["label"])
+			if norm == "" {
+				continue
+			}
+			if _, ok := refs[norm]; !ok {
+				refs[norm] = LinkRef{URL: d["url"], Title: d["title"]}
+			}
+		}
+	}
 	var visit func(bs []any)
 	visit = func(bs []any) {
 		for _, v := range bs {
@@ -2601,6 +2620,8 @@ func GatherAllLinkRefs(blocks []any) LinkRefMap {
 			if !ok {
 				continue
 			}
+			// Implicit defs stashed on the block by @setext-promote.
+			absorb(b)
 			switch b["type"] {
 			case "paragraph":
 				text, _ := b["text"].(string)

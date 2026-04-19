@@ -344,24 +344,31 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     '@setext-promote': (_r: Rule, ctx: Context) => {
       const { level } = r_o0_val(_r) as { level: number }
       const block = ctx.u.mdCurrent
-      // Strip leading link reference definitions. Only what's left over
-      // becomes the heading's content. If nothing remains, convert the
-      // block into a synthetic paragraph containing the underline (so
-      // it renders as literal text instead of as an empty heading).
+      // Strip leading link reference definitions. Definitions that
+      // were consumed are stashed on a non-enumerable `_implicitRefDefs`
+      // property of the block so the document-level ref gathering picks
+      // them up even though the enclosing paragraph became a heading.
       let text = block.text
+      const defs: { label: string; url: string; title: string }[] = []
       while (true) {
         const def = parseLinkRefDef(text)
         if (!def) break
+        defs.push({ label: def.label, url: def.url, title: def.title })
         text = text.slice(def.length)
+      }
+      if (defs.length > 0) {
+        Object.defineProperty(block, '_implicitRefDefs', {
+          value: defs,
+          enumerable: false,
+          writable: true,
+        })
       }
       text = text.trim()
       if (text.length === 0) {
         // No heading content — paragraph promoted nothing. Leave block
         // as a paragraph containing whatever original text was there.
-        // The setext underline line itself is already consumed from the
-        // token stream, so we can't include it here; the block simply
-        // remains a paragraph of its ref-def text (which will drop out
-        // later during ref extraction).
+        // The enclosing paragraph will drop out later during ref
+        // extraction (its text is purely ref-def content).
         return
       }
       block.type = 'heading'
@@ -831,9 +838,9 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       }
 
       // Indented line (4+ spaces or leading tab): indented code block,
-      // unless we're currently inside a paragraph (paragraph
-      // continuation) or inside a list item that's still accumulating a
-      // paragraph — in which case this is a lazy continuation line.
+      // unless we're currently inside a paragraph or inside a list item
+      // still accumulating a paragraph — in which case this is a lazy
+      // continuation line.
       else if (/^(?:    |\t)/.test(lineContent)) {
         if (
           state.last === 'text' ||
@@ -2257,8 +2264,21 @@ function escapeHtmlString(s: string): string {
 // item are visible to the document as a whole.
 function gatherAllLinkRefs(blocks: MdBlock[]): LinkRefMap {
   const refs: LinkRefMap = {}
+  const absorb = (defs: any[] | undefined) => {
+    if (!defs) return
+    for (const d of defs) {
+      const norm = normalizeLinkLabel(d.label)
+      if (norm.length > 0 && !(norm in refs)) {
+        refs[norm] = { url: d.url, title: d.title }
+      }
+    }
+  }
   const visit = (bs: MdBlock[]) => {
     for (const b of bs) {
+      // Implicit defs stashed on the block by @setext-promote for
+      // paragraphs that were promoted to headings after leading ref
+      // defs were stripped.
+      absorb((b as any)._implicitRefDefs)
       if (b.type === 'paragraph') {
         let text = (b as any).text
         while (true) {

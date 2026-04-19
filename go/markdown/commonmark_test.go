@@ -25,8 +25,8 @@ import (
 
 // minCommonMarkPasses is the regression floor. Bump upward as the parser
 // improves; never decrease without an explanation in the commit.
-// Current baseline: 621/652 (step 31: lazy-in-indented inside list item).
-const minCommonMarkPasses = 617
+// Current baseline: 622/652 (step 32: setext-promote preserves ref defs).
+const minCommonMarkPasses = 618
 
 type commonMarkCase struct {
 	Markdown  string `json:"markdown"`
