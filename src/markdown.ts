@@ -1331,8 +1331,15 @@ const NO_REFS: LinkRefMap = {}
 // operators, etc., which CommonMark treats like punctuation for flanking.
 const ASCII_PUNCT = /[!-/:-@\[-`{-~]|\p{P}|\p{S}/u
 
+// Unicode whitespace per CommonMark: ASCII space/tab/LF/CR/FF plus any
+// character in the Unicode Zs (Space Separator) general category, e.g.
+// non-breaking space (U+00A0), figure space, etc.
+const UNICODE_WS = /^\p{Zs}$/u
 function isWhitespaceChar(c: string): boolean {
-  return c === '' || c === ' ' || c === '\t' || c === '\n' || c === '\r'
+  if (c === '' || c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f') {
+    return true
+  }
+  return UNICODE_WS.test(c)
 }
 
 // parseLinkTarget parses `(URL[ "TITLE"])` starting at position i in s and

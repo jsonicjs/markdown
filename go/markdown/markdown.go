@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	jsonic "github.com/jsonicjs/jsonic/go"
 )
@@ -583,14 +585,28 @@ func renderListItemFromBlocks(cleaned []any, nestedRefs LinkRefMap, loose bool, 
 	if !loose && len(parts) == 1 && (len(parts[0]) == 0 || parts[0][0] != '<') {
 		return "<li>" + parts[0] + "</li>"
 	}
-	// If the first part is inline text from a tight paragraph, keep it
-	// flush with the `<li>` open tag (no leading newline).
+	// Tight-mode inline text at the first or last slot sits flush
+	// against the `<li>` boundary (no leading/trailing newline). This
+	// matches CommonMark's `<li>a\n<ul>...</ul>\n</li>` and
+	// `<li>\n<h2>Bar</h2>\nbaz</li>` shapes.
 	firstInline := !loose && len(parts) > 0 && (len(parts[0]) == 0 || parts[0][0] != '<')
+	last := parts[len(parts)-1]
+	lastInline := !loose && (len(last) == 0 || last[0] != '<')
+	open := "<li>\n"
 	if firstInline {
-		rest := strings.Join(parts[1:], "\n")
-		return "<li>" + parts[0] + "\n" + rest + "\n</li>"
+		open = "<li>" + parts[0] + "\n"
 	}
-	return "<li>\n" + strings.Join(parts, "\n") + "\n</li>"
+	var mid string
+	if firstInline {
+		mid = strings.Join(parts[1:], "\n")
+	} else {
+		mid = strings.Join(parts, "\n")
+	}
+	close := "\n</li>"
+	if lastInline {
+		close = "</li>"
+	}
+	return open + mid + close
 }
 
 // parseNested runs the markdown parser on a substring for use inside a
@@ -1541,18 +1557,28 @@ type LinkRef struct {
 // LinkRefMap is label (normalized) to definition mapping.
 type LinkRefMap = map[string]LinkRef
 
-// asciiPunct reports whether b is an ASCII punctuation character used by
-// CommonMark's flanking classification (approximation; the full spec uses
-// Unicode punctuation).
-func asciiPunct(b byte) bool {
-	return (b >= '!' && b <= '/') ||
-		(b >= ':' && b <= '@') ||
-		(b >= '[' && b <= '`') ||
-		(b >= '{' && b <= '~')
+// isFlankingPunct reports whether r is punctuation or symbol per
+// CommonMark's flanking classification: ASCII punctuation plus any
+// Unicode character in general category P (punctuation) or S (symbol).
+func isFlankingPunct(r rune) bool {
+	if r < 0x80 {
+		return (r >= '!' && r <= '/') ||
+			(r >= ':' && r <= '@') ||
+			(r >= '[' && r <= '`') ||
+			(r >= '{' && r <= '~')
+	}
+	return unicode.IsPunct(r) || unicode.IsSymbol(r)
 }
 
-func isInlineWS(b byte) bool {
-	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+// isFlankingWS reports whether r is whitespace per CommonMark's
+// flanking classification: ASCII whitespace plus any Unicode Zs
+// (Space Separator) character such as NBSP.
+func isFlankingWS(r rune) bool {
+	switch r {
+	case ' ', '\t', '\n', '\r', '\f':
+		return true
+	}
+	return unicode.Is(unicode.Zs, r)
 }
 
 // parseLinkTarget parses `(URL[ "TITLE"])` starting at position i in s and
@@ -2402,17 +2428,24 @@ func tokenizeInline(s string) []*inlineSeg {
 			for i+length < n && s[i+length] == c {
 				length++
 			}
-			var before, after byte = ' ', ' '
+			// Flanking classification needs the full rune before/after
+			// the delimiter run, not just the adjacent byte — otherwise
+			// multi-byte characters (e.g. NBSP, £, €, Cyrillic letters)
+			// would be mistaken for ASCII non-space non-punctuation.
+			var before rune = ' '
 			if i > 0 {
-				before = s[i-1]
+				r, _ := utf8.DecodeLastRuneInString(s[:i])
+				before = r
 			}
+			var after rune = ' '
 			if i+length < n {
-				after = s[i+length]
+				r, _ := utf8.DecodeRuneInString(s[i+length:])
+				after = r
 			}
-			beforeWS := isInlineWS(before)
-			afterWS := isInlineWS(after)
-			beforeP := asciiPunct(before)
-			afterP := asciiPunct(after)
+			beforeWS := isFlankingWS(before)
+			afterWS := isFlankingWS(after)
+			beforeP := isFlankingPunct(before)
+			afterP := isFlankingPunct(after)
 
 			leftFlanking := !afterWS && (!afterP || beforeWS || beforeP)
 			rightFlanking := !beforeWS && (!beforeP || afterWS || afterP)
@@ -2463,8 +2496,22 @@ func tokenizeInline(s string) []*inlineSeg {
 			continue
 		}
 
-		appendText(string(c))
-		i++
+		// Plain character — consume a full UTF-8 rune so multi-byte
+		// characters survive as-is rather than being split into the
+		// individual bytes of their UTF-8 encoding.
+		if c < 0x80 {
+			appendText(string(c))
+			i++
+		} else {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && size <= 1 {
+				appendText(string(c))
+				i++
+			} else {
+				appendText(s[i : i+size])
+				i += size
+			}
+		}
 	}
 
 	return segs

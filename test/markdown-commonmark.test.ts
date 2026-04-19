@@ -43,8 +43,8 @@ const spec: SpecCase[] = JSON.parse(readFileSync(specPath, 'utf8'))
 
 // Minimum expected pass count — acts as a regression floor. Bump upward as
 // the parser improves. Never decrease without an explanation in the commit.
-// Current baseline: 642/652 (step 38: emphasis rule 15 inner-delim removal).
-const MIN_PASSES = 639
+// Current baseline: 643/652 (step 39: Unicode-aware emphasis flanking).
+const MIN_PASSES = 640
 
 describe('commonmark-spec', () => {
   test('conformance-summary', () => {
