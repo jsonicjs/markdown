@@ -55,7 +55,7 @@ const grammarText = `
   ]
 
   rule: block: open: [
-    { s: '#MB'  g: 'md,blank' }
+    { s: '#MB'  a: '@block-blank-seen' g: 'md,blank' }
     { s: '#MH'  a: '@heading'    g: 'md,heading' }
     { s: '#MR'  a: '@hr'         g: 'md,hr' }
     { s: '#MC'  a: '@code'       g: 'md,code' }
@@ -85,7 +85,7 @@ const grammarText = `
     { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,blank,item' }
     { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,blank,cont' }
     { s: '#MB'  a: '@list-blank'  r: list-tail-blank g: 'md,list,blank,more' }
-    { g: 'md,list,blank,end' }
+    { a: '@list-blank-escape' g: 'md,list,blank,end' }
   ]
 
   rule: quote-tail: open: [
@@ -165,6 +165,15 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			r.Node = make([]any, 0)
 		}),
 
+		// Mark that a blank line separated the previous block from whatever
+		// block the `block` rule is about to open. Each block-start action
+		// consumes this flag and stashes `_precededByBlank: true` on the
+		// newly-opened block so renderListItem can determine loose-vs-tight
+		// dynamically.
+		"@block-blank-seen": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			ensureMeta(ctx)["blockBlankSeen"] = true
+		}),
+
 		"@heading": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(map[string]any)
 			block := map[string]any{
@@ -172,6 +181,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				"level": v["level"],
 				"text":  v["text"],
 			}
+			markPrecededByBlank(block, ctx)
 			if emitHTML {
 				block["html"] = RenderHTML(block)
 			}
@@ -180,6 +190,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 
 		"@hr": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			block := map[string]any{"type": "hr"}
+			markPrecededByBlank(block, ctx)
 			if emitHTML {
 				block["html"] = RenderHTML(block)
 			}
@@ -193,6 +204,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				"lang": v["lang"],
 				"text": v["text"],
 			}
+			markPrecededByBlank(block, ctx)
 			if emitHTML {
 				block["html"] = RenderHTML(block)
 			}
@@ -202,6 +214,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 		"@htmlblock": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(string)
 			block := map[string]any{"type": "html", "text": v}
+			markPrecededByBlank(block, ctx)
 			if emitHTML {
 				block["html"] = v
 			}
@@ -220,6 +233,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 					block["start"] = start
 				}
 			}
+			markPrecededByBlank(block, ctx)
 			pushBlock(r, block)
 			meta := ensureMeta(ctx)
 			meta["mdCurrent"] = block
@@ -271,7 +285,9 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			pending, _ := ctx.Meta["listPendingBlank"].(bool)
 			pendingBlanks, _ := ctx.Meta["listPendingBlanks"].(int)
 			if pending {
-				cur["loose"] = true
+				// Preserve the exact number of blank lines so nested code
+				// fences and other constructs render with the right
+				// internal spacing. Looseness is decided at render time.
 				last["text"] = text + strings.Repeat("\n", pendingBlanks+1) + v
 				ctx.Meta["listPendingBlank"] = false
 				ctx.Meta["listPendingBlanks"] = 0
@@ -287,6 +303,16 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			meta["listPendingBlank"] = true
 			cnt, _ := meta["listPendingBlanks"].(int)
 			meta["listPendingBlanks"] = cnt + 1
+		}),
+
+		// list-tail-blank fell through: no further item / continuation /
+		// blank consumed the dangling blank(s). The list ends here and
+		// the blank effectively separates the list from whatever block
+		// follows, so the next block should render as preceded-by-blank.
+		"@list-blank-escape": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			if pending, _ := ctx.Meta["listPendingBlank"].(bool); pending {
+				ctx.Meta["blockBlankSeen"] = true
+			}
 		}),
 
 		// Lazy paragraph continuation: a plain text line inside list-tail
@@ -308,6 +334,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 		"@quote-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(string)
 			block := map[string]any{"type": "blockquote", "text": v}
+			markPrecededByBlank(block, ctx)
 			pushBlock(r, block)
 			ensureMeta(ctx)["mdCurrent"] = block
 			// HTML for blockquotes is deferred to ToHTML so the nested
@@ -339,6 +366,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				v = strings.TrimSpace(v)
 			}
 			block := map[string]any{"type": "paragraph", "text": v}
+			markPrecededByBlank(block, ctx)
 			if emitHTML {
 				block["html"] = RenderHTML(block)
 			}
@@ -395,6 +423,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 		"@icode-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(string)
 			block := map[string]any{"type": "code", "lang": "", "text": v}
+			markPrecededByBlank(block, ctx)
 			if emitHTML {
 				block["html"] = RenderHTML(block)
 			}
@@ -462,15 +491,30 @@ func ensureMeta(ctx *jsonic.Context) map[string]any {
 	return ctx.Meta
 }
 
-// renderListItem sub-parses the item's accumulated text and renders each
-// nested block. In tight lists a singleton paragraph is rendered without
+// markPrecededByBlank stamps the newly-opened block with
+// `_precededByBlank: true` if the `block` rule just consumed a `#MB`.
+// Used by list rendering to decide loose-vs-tight dynamically: a list
+// item whose sub-parse has top-level blocks separated by blanks forces
+// the enclosing list to render loose, whereas blanks that belong to
+// nested content stay inside the nested block. Only sub-parsed blocks
+// are marked — the top-level parse swallows the flag so users never
+// see the internal `_precededByBlank` key on returned block maps.
+func markPrecededByBlank(block map[string]any, ctx *jsonic.Context) {
+	if seen, _ := ctx.Meta["blockBlankSeen"].(bool); seen {
+		if subparseActive {
+			block["_precededByBlank"] = true
+		}
+		ctx.Meta["blockBlankSeen"] = false
+	}
+}
+
+// renderListItemFromBlocks renders a list item from its already-parsed
+// sub-blocks. In tight lists a singleton paragraph is rendered without
 // its `<p>` wrapper (matching CommonMark).
-func renderListItem(text string, loose bool, refs LinkRefMap) string {
-	if text == "" {
+func renderListItemFromBlocks(cleaned []any, nestedRefs LinkRefMap, loose bool, refs LinkRefMap) string {
+	if len(cleaned) == 0 {
 		return "<li></li>"
 	}
-	nested := parseNested(text)
-	nestedRefs, cleaned := ExtractLinkRefsAndClean(nested)
 	merged := LinkRefMap{}
 	for k, v := range refs {
 		merged[k] = v
@@ -522,7 +566,10 @@ func parseNested(src string) []any {
 		}
 		nestedParser = j
 	}
+	prev := subparseActive
+	subparseActive = true
 	result, err := nestedParser.Parse(src)
+	subparseActive = prev
 	if err != nil {
 		return nil
 	}
@@ -531,6 +578,12 @@ func parseNested(src string) []any {
 	}
 	return nil
 }
+
+// subparseActive is set true while parseNested is running so that
+// markPrecededByBlank stamps its flag only on sub-parsed blocks. Go
+// maps lack non-enumerable properties, so leaking `_precededByBlank`
+// onto user-visible top-level blocks would pollute the output.
+var subparseActive bool
 
 // splitParagraphs splits a loose-list item's accumulated text on runs of
 // two or more newlines. Empty trailing chunks are dropped.
@@ -903,7 +956,14 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 						codeEnd = nextEnd
 					}
 
-					codeText := strings.Join(codeLines, "\n")
+					// Each content line contributes `<line>\n`, so the
+					// joined text needs a terminal newline too (matters
+					// when the final line is blank — Join drops the
+					// trailing separator).
+					codeText := ""
+					if len(codeLines) > 0 {
+						codeText = strings.Join(codeLines, "\n") + "\n"
+					}
 					consumeEnd = codeEnd
 					srcPart := src[sI:consumeEnd]
 					val := map[string]any{"lang": lang, "text": codeText}
@@ -1166,18 +1226,50 @@ func renderBlockHTML(block map[string]any, refs LinkRefMap) string {
 				startAttr = fmt.Sprintf(` start="%d"`, start)
 			}
 		}
+		// Pre-parse each item so we can (a) inspect top-level blocks for
+		// `_precededByBlank` to decide dynamic looseness and (b) reuse the
+		// parse result when rendering.
+		type parsedItem struct {
+			cleaned []any
+			refs    LinkRefMap
+		}
+		parsedItems := make([]parsedItem, len(items))
+		for i, it := range items {
+			m, _ := it.(map[string]any)
+			text, _ := m["text"].(string)
+			if text == "" {
+				parsedItems[i] = parsedItem{cleaned: nil, refs: LinkRefMap{}}
+				continue
+			}
+			nested := parseNested(text)
+			// Detect blank-separated top-level blocks BEFORE extracting
+			// link-reference definitions — ref defs sometimes occupy the
+			// blank-preceded slot and must still count toward looseness.
+			if !loose {
+				for j := 1; j < len(nested); j++ {
+					nb, ok := nested[j].(map[string]any)
+					if !ok {
+						continue
+					}
+					if blank, _ := nb["_precededByBlank"].(bool); blank {
+						loose = true
+						break
+					}
+				}
+			}
+			nestedRefs, cleaned := ExtractLinkRefsAndClean(nested)
+			parsedItems[i] = parsedItem{cleaned: cleaned, refs: nestedRefs}
+		}
 		var b strings.Builder
 		b.WriteString("<")
 		b.WriteString(tag)
 		b.WriteString(startAttr)
 		b.WriteString(">\n")
-		for i, it := range items {
+		for i, p := range parsedItems {
 			if i > 0 {
 				b.WriteByte('\n')
 			}
-			m, _ := it.(map[string]any)
-			text, _ := m["text"].(string)
-			b.WriteString(renderListItem(text, loose, refs))
+			b.WriteString(renderListItemFromBlocks(p.cleaned, p.refs, loose, refs))
 		}
 		b.WriteString("\n</")
 		b.WriteString(tag)

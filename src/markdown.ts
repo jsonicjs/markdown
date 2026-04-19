@@ -75,7 +75,7 @@ const grammarText = `
   ]
 
   rule: block: open: [
-    { s: '#MB'  g: 'md,blank' }
+    { s: '#MB'  a: '@block-blank-seen' g: 'md,blank' }
     { s: '#MH'  a: '@heading'    g: 'md,heading' }
     { s: '#MR'  a: '@hr'         g: 'md,hr' }
     { s: '#MC'  a: '@code'       g: 'md,code' }
@@ -105,7 +105,7 @@ const grammarText = `
     { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,blank,item' }
     { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,blank,cont' }
     { s: '#MB'  a: '@list-blank'  r: list-tail-blank g: 'md,list,blank,more' }
-    { g: 'md,list,blank,end' }
+    { a: '@list-blank-escape' g: 'md,list,blank,end' }
   ]
 
   rule: quote-tail: open: [
@@ -161,32 +161,45 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       r.node = []
     },
 
+    // Mark that a blank line separated the previous block from whatever
+    // block the `block` rule is about to open. Each block-start action
+    // consumes this flag and stashes `_precededByBlank: true` on the
+    // newly-opened block so renderListItem can determine loose-vs-tight
+    // dynamically.
+    '@block-blank-seen': (_r: Rule, ctx: Context) => {
+      ctx.u.blockBlankSeen = true
+    },
+
 
     // === Alt actions ===
 
-    '@heading': (r: Rule) => {
+    '@heading': (r: Rule, ctx: Context) => {
       const v = r.o0.val as { level: number; text: string }
       const block: any = { type: 'heading', level: v.level, text: v.text }
+      markPrecededByBlank(block, ctx)
       if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
     },
 
-    '@hr': (r: Rule) => {
+    '@hr': (r: Rule, ctx: Context) => {
       const block: any = { type: 'hr' }
+      markPrecededByBlank(block, ctx)
       if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
     },
 
-    '@code': (r: Rule) => {
+    '@code': (r: Rule, ctx: Context) => {
       const v = r.o0.val as { lang: string; text: string }
       const block: any = { type: 'code', lang: v.lang, text: v.text }
+      markPrecededByBlank(block, ctx)
       if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
     },
 
-    '@htmlblock': (r: Rule) => {
+    '@htmlblock': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
       const block: any = { type: 'html', text: v }
+      markPrecededByBlank(block, ctx)
       if (emitHtml) block.html = v
       r.node.push(block)
     },
@@ -211,6 +224,7 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       if (v.ordered && v.start !== undefined && v.start !== 1) {
         block.start = v.start
       }
+      markPrecededByBlank(block, ctx)
       r.node.push(block)
       ctx.u.mdCurrent = block
       // Reset blank-tracking so a pending blank left over from a prior
@@ -262,10 +276,10 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       const last = items[items.length - 1]
       const pendingBlanks = (ctx.u.listPendingBlanks as number) || 0
       if (ctx.u.listPendingBlank) {
-        block.loose = true
         // Preserve the exact number of blank lines so nested code fences
-        // and other constructs in loose items render with the right
-        // internal spacing.
+        // and other constructs render with the right internal spacing.
+        // Looseness is decided at render time based on whether the
+        // sub-parsed item has top-level blocks separated by blanks.
         last.text += '\n'.repeat(pendingBlanks + 1) + v
         ctx.u.listPendingBlank = false
         ctx.u.listPendingBlanks = 0
@@ -282,6 +296,16 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       ctx.u.listPendingBlank = true
       ctx.u.listPendingBlanks =
         ((ctx.u.listPendingBlanks as number) || 0) + 1
+    },
+
+    // list-tail-blank fell through: no further item / continuation / blank
+    // consumed the dangling blank(s). The list ends here and the blank
+    // effectively separates the list from whatever block follows, so the
+    // next block should render as preceded-by-blank.
+    '@list-blank-escape': (_r: Rule, ctx: Context) => {
+      if (ctx.u.listPendingBlank) {
+        ctx.u.blockBlankSeen = true
+      }
     },
 
     // A plain #MT line inside list-tail is a lazy continuation of the
@@ -301,6 +325,7 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     '@quote-start': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
       const block: any = { type: 'blockquote', text: v }
+      markPrecededByBlank(block, ctx)
       r.node.push(block)
       ctx.u.mdCurrent = block
       // HTML is deferred until toHtml runs so that the nested parse the
@@ -327,6 +352,7 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
         type: 'paragraph',
         text: options.trim ? v.trim() : v,
       }
+      markPrecededByBlank(block, ctx)
       if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
       ctx.u.mdCurrent = block
@@ -379,6 +405,7 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     '@icode-start': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
       const block: any = { type: 'code', lang: '', text: v }
+      markPrecededByBlank(block, ctx)
       if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
       ctx.u.mdCurrent = block
@@ -401,6 +428,23 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
   // Helper used by @setext-promote so the body reads naturally.
   function r_o0_val(r: Rule): any {
     return r.o0.val
+  }
+
+  // If the `block` rule just consumed a `#MB`, stamp the newly-opened
+  // block as `_precededByBlank` (non-enumerable) and clear the flag.
+  // Used by list rendering to decide loose-vs-tight dynamically: a list
+  // item whose sub-parse has top-level blocks separated by blanks
+  // forces the enclosing list to render loose, whereas blanks that
+  // belong to nested content stay inside the nested block.
+  function markPrecededByBlank(block: any, ctx: Context): void {
+    if (ctx.u.blockBlankSeen) {
+      Object.defineProperty(block, '_precededByBlank', {
+        value: true,
+        enumerable: false,
+        writable: true,
+      })
+      ctx.u.blockBlankSeen = false
+    }
   }
 
 
@@ -703,7 +747,11 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
               codeEnd = nextEnd
             }
 
-            const codeText = codeLines.join('\n')
+            // Each content line contributes `<line>\n`, so the joined
+            // text needs a terminal newline too (matters when the final
+            // line is blank — lines.join drops the trailing separator).
+            const codeText =
+              codeLines.length > 0 ? codeLines.join('\n') + '\n' : ''
             consumeEnd = codeEnd
             srcPart = src.substring(sI, consumeEnd)
             tkn = lex.token('#MC', { lang, text: codeText }, srcPart, pnt)
@@ -965,13 +1013,49 @@ function renderHtml(block: any, refs: LinkRefMap = NO_REFS): string {
     }
     case 'list': {
       const tag = block.ordered ? 'ol' : 'ul'
-      const loose = !!block.loose
+      let loose = !!block.loose
       const startAttr =
         block.ordered && block.start !== undefined && block.start !== 1
           ? ` start="${block.start}"`
           : ''
-      const items = block.items
-        .map((it: any) => renderListItem(it.text, loose, refs))
+      // Pre-parse each item so we can (a) inspect top-level blocks for
+      // `_precededByBlank` to decide dynamic looseness and (b) reuse the
+      // parse result when rendering.
+      const parsedItems = block.items.map((it: any) => {
+        if ((it.text as string).length === 0) {
+          return {
+            ex: { blocks: [] as MdBlock[], refs: {} as LinkRefMap },
+            hasBlank: false,
+          }
+        }
+        const nested = parseNested(it.text) as MdBlock[]
+        // Detect blank-separated top-level blocks BEFORE extracting
+        // link-reference definitions — ref defs sometimes occupy the
+        // blank-preceded slot and must still be counted toward looseness.
+        let hasBlank = false
+        for (let i = 1; i < nested.length; i++) {
+          if ((nested[i] as any)._precededByBlank) {
+            hasBlank = true
+            break
+          }
+        }
+        return { ex: extractLinkRefsAndClean(nested), hasBlank }
+      })
+      if (!loose) {
+        for (const p of parsedItems) {
+          if (p.hasBlank) {
+            loose = true
+            break
+          }
+        }
+      }
+      const items = parsedItems
+        .map(
+          (p: {
+            ex: { blocks: MdBlock[]; refs: LinkRefMap }
+            hasBlank: boolean
+          }) => renderListItemFromBlocks(p.ex, loose, refs),
+        )
         .join('\n')
       return `<${tag}${startAttr}>\n${items}\n</${tag}>`
     }
@@ -999,18 +1083,16 @@ function renderHtml(block: any, refs: LinkRefMap = NO_REFS): string {
   return ''
 }
 
-// renderListItem sub-parses the item's accumulated text and renders each
-// nested block. In tight lists a singleton paragraph is rendered without
-// its `<p>` wrapper (matching CommonMark), while other block types always
-// render in full.
-function renderListItem(
-  text: string,
+// renderListItemFromBlocks renders a list item from its already-parsed
+// sub-blocks. In tight lists a singleton paragraph is rendered without
+// its `<p>` wrapper (matching CommonMark), while other block types
+// always render in full.
+function renderListItemFromBlocks(
+  ex: { blocks: MdBlock[]; refs: LinkRefMap },
   loose: boolean,
   refs: LinkRefMap,
 ): string {
-  if (text.length === 0) return `<li></li>`
-  const nested = parseNested(text) as MdBlock[]
-  const ex = extractLinkRefsAndClean(nested)
+  if (ex.blocks.length === 0) return `<li></li>`
   const merged: LinkRefMap = { ...refs }
   for (const k of Object.keys(ex.refs)) {
     if (!(k in merged)) merged[k] = ex.refs[k]
@@ -1546,7 +1628,19 @@ function extractLinkRefsAndClean(
       text = text.slice(def.length)
     }
     if (text.length > 0) {
-      out.push({ ...b, text })
+      if (text === b.text) {
+        out.push(b)
+      } else {
+        const cloned: any = { ...b, text }
+        if ((b as any)._precededByBlank) {
+          Object.defineProperty(cloned, '_precededByBlank', {
+            value: true,
+            enumerable: false,
+            writable: true,
+          })
+        }
+        out.push(cloned)
+      }
     }
   }
   return { refs, blocks: out }

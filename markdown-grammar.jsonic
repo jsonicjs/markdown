@@ -36,7 +36,7 @@
   ]
 
   rule: block: open: [
-    { s: '#MB'  g: 'md,blank' }
+    { s: '#MB'  a: '@block-blank-seen' g: 'md,blank' }
     { s: '#MH'  a: '@heading'    g: 'md,heading' }
     { s: '#MR'  a: '@hr'         g: 'md,hr' }
     { s: '#MC'  a: '@code'       g: 'md,code' }
@@ -66,7 +66,7 @@
     { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,blank,item' }
     { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,blank,cont' }
     { s: '#MB'  a: '@list-blank'  r: list-tail-blank g: 'md,list,blank,more' }
-    { g: 'md,list,blank,end' }
+    { a: '@list-blank-escape' g: 'md,list,blank,end' }
   ]
 
   rule: quote-tail: open: [

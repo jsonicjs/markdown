@@ -184,9 +184,11 @@ func TestBlockquote(t *testing.T) {
 }
 
 func TestCodeBlock(t *testing.T) {
+	// Fenced code text retains the terminal newline of the last content
+	// line so a trailing blank (e.g. "foo\n\n") is not lost.
 	r, _ := mdParse("```\nplain code\n```")
 	assertEqual(t, "plain", r, []any{
-		map[string]any{"type": "code", "lang": "", "text": "plain code"},
+		map[string]any{"type": "code", "lang": "", "text": "plain code\n"},
 	})
 
 	r2, _ := mdParse("```js\nconst x = 1\nconst y = 2\n```")
@@ -194,14 +196,14 @@ func TestCodeBlock(t *testing.T) {
 		map[string]any{
 			"type": "code",
 			"lang": "js",
-			"text": "const x = 1\nconst y = 2",
+			"text": "const x = 1\nconst y = 2\n",
 		},
 	})
 
 	// Unclosed fence captures to end.
 	r3, _ := mdParse("```py\nprint(1)\n")
 	assertEqual(t, "unclosed", r3, []any{
-		map[string]any{"type": "code", "lang": "py", "text": "print(1)"},
+		map[string]any{"type": "code", "lang": "py", "text": "print(1)\n"},
 	})
 }
 
@@ -246,7 +248,7 @@ End.
 			},
 		},
 		map[string]any{"type": "blockquote", "text": "quote line"},
-		map[string]any{"type": "code", "lang": "ts", "text": "let a = 1"},
+		map[string]any{"type": "code", "lang": "ts", "text": "let a = 1\n"},
 		map[string]any{"type": "hr"},
 		map[string]any{"type": "paragraph", "text": "End."},
 	})

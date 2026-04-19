@@ -99,15 +99,17 @@ describe('markdown', () => {
 
   test('code-block', () => {
     const md = Jsonic.make().use(Markdown)
+    // Fenced code text retains the terminal newline of the last content
+    // line so a trailing blank line (e.g. "foo\n\n") is not lost.
     assert.deepEqual(md('```\nplain code\n```'), [
-      { type: 'code', lang: '', text: 'plain code' },
+      { type: 'code', lang: '', text: 'plain code\n' },
     ])
     assert.deepEqual(md('```js\nconst x = 1\nconst y = 2\n```'), [
-      { type: 'code', lang: 'js', text: 'const x = 1\nconst y = 2' },
+      { type: 'code', lang: 'js', text: 'const x = 1\nconst y = 2\n' },
     ])
     // Unclosed fence captures to end.
     assert.deepEqual(md('```py\nprint(1)\n'), [
-      { type: 'code', lang: 'py', text: 'print(1)' },
+      { type: 'code', lang: 'py', text: 'print(1)\n' },
     ])
   })
 
@@ -146,7 +148,7 @@ End.
         items: [{ text: 'one' }, { text: 'two' }],
       },
       { type: 'blockquote', text: 'quote line' },
-      { type: 'code', lang: 'ts', text: 'let a = 1' },
+      { type: 'code', lang: 'ts', text: 'let a = 1\n' },
       { type: 'hr' },
       { type: 'paragraph', text: 'End.' },
     ])
