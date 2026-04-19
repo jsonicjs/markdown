@@ -94,6 +94,8 @@ const grammarText = `
   rule: quote-tail: open: [
     { s: '#MQ' a: '@quote-append' r: quote-tail g: 'md,quote,more' }
     { s: '#MT' a: '@quote-append' r: quote-tail c: '@quote-lazy-ok' g: 'md,quote,lazy' }
+    { s: '#MSX' a: '@quote-lazy-msx' r: quote-tail c: '@quote-lazy-ok' g: 'md,quote,lazy,msx' }
+    { s: '#MIC' a: '@quote-lazy-mic' r: quote-tail c: '@quote-lazy-para-ok' g: 'md,quote,lazy,mic' }
     { g: 'md,quote,end' }
   ]
 
@@ -350,6 +352,60 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
 			text, _ := cur["text"].(string)
 			cur["text"] = text + "\n" + v
+		}),
+
+		// A `===` / `---` line inside a blockquote cannot attach as a
+		// setext underline to a lazy-continuation paragraph (CM § 4.3).
+		// Fold it onto the blockquote's accumulated text prefixed with
+		// four spaces so the blockquote sub-parse sees the line as a
+		// lazy continuation of the paragraph rather than a fresh setext
+		// underline (example 93).
+		"@quote-lazy-msx": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			v, _ := r.O0.Val.(map[string]any)
+			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			text, _ := cur["text"].(string)
+			raw, _ := v["raw"].(string)
+			cur["text"] = text + "\n    " + strings.TrimLeft(raw, " \t")
+		}),
+
+		// Indented line inside a blockquote without strict `>` prefix:
+		// a lazy continuation of the blockquote's open paragraph
+		// (example 238). Re-indent with four spaces so the blockquote
+		// sub-parse treats it as lazy paragraph text rather than a
+		// fresh block (list, heading, etc.).
+		"@quote-lazy-mic": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			v, _ := r.O0.Val.(string)
+			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			text, _ := cur["text"].(string)
+			cur["text"] = text + "\n    " + v
+		}),
+
+		// Guard: lazy continuation of a blockquote paragraph applies
+		// only when the blockquote has an open paragraph — the
+		// accumulated text must be non-empty and its last line must
+		// not itself be indented code (which signals the inner
+		// paragraph has closed).
+		"@quote-lazy-para-ok": jsonic.AltCond(func(r *jsonic.Rule, ctx *jsonic.Context) bool {
+			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			if cur == nil {
+				return false
+			}
+			text, _ := cur["text"].(string)
+			if text == "" || strings.HasSuffix(text, "\n") {
+				return false
+			}
+			lastNL := strings.LastIndex(text, "\n")
+			lastLine := text
+			if lastNL >= 0 {
+				lastLine = text[lastNL+1:]
+			}
+			if lastLine == "" {
+				return false
+			}
+			if strings.HasPrefix(lastLine, "    ") || strings.HasPrefix(lastLine, "\t") {
+				return false
+			}
+			return true
 		}),
 
 		// Lazy continuation of a blockquote paragraph is only allowed when

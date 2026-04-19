@@ -112,6 +112,8 @@ const grammarText = `
   rule: quote-tail: open: [
     { s: '#MQ' a: '@quote-append' r: quote-tail g: 'md,quote,more' }
     { s: '#MT' a: '@quote-append' r: quote-tail c: '@quote-lazy-ok' g: 'md,quote,lazy' }
+    { s: '#MSX' a: '@quote-lazy-msx' r: quote-tail c: '@quote-lazy-ok' g: 'md,quote,lazy,msx' }
+    { s: '#MIC' a: '@quote-lazy-mic' r: quote-tail c: '@quote-lazy-para-ok' g: 'md,quote,lazy,mic' }
     { g: 'md,quote,end' }
   ]
 
@@ -337,6 +339,43 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     '@quote-append': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
       ctx.u.mdCurrent.text += '\n' + v
+    },
+
+    // A `===` / `---` line inside a blockquote cannot attach as a
+    // setext underline to a lazy-continuation paragraph (CM § 4.3).
+    // Fold it onto the blockquote's accumulated text prefixed with
+    // four spaces so the blockquote sub-parse sees the line as a
+    // lazy continuation of the paragraph rather than a fresh setext
+    // underline (example 93).
+    '@quote-lazy-msx': (r: Rule, ctx: Context) => {
+      const v = r.o0.val as { level: number; raw: string }
+      ctx.u.mdCurrent.text += '\n    ' + v.raw.trimStart()
+    },
+
+    // Guard: lazy continuation of a blockquote paragraph applies only
+    // when the blockquote has an open paragraph — the accumulated text
+    // is non-empty AND its last line is not itself indented code
+    // (which would signal the inner paragraph has closed).
+    '@quote-lazy-para-ok': (_r: Rule, ctx: Context) => {
+      const text = (ctx.u.mdCurrent?.text ?? '') as string
+      if (text.length === 0 || /\n$/.test(text)) return false
+      // Find the last line; if it's 4+ spaces indented OR empty,
+      // there's no open paragraph to continue.
+      const lastNL = text.lastIndexOf('\n')
+      const lastLine = lastNL < 0 ? text : text.slice(lastNL + 1)
+      if (lastLine.length === 0) return false
+      if (/^(?:    |\t)/.test(lastLine)) return false
+      return true
+    },
+
+    // Indented line inside a blockquote without strict `>` prefix: a
+    // lazy continuation of the blockquote's open paragraph (spec
+    // example 238). Re-indent the stripped content with four spaces
+    // so the blockquote's sub-parse treats it as lazy paragraph text
+    // rather than as a block start (list, heading, etc.).
+    '@quote-lazy-mic': (r: Rule, ctx: Context) => {
+      const v = r.o0.val as string
+      ctx.u.mdCurrent.text += '\n    ' + v
     },
 
     // Lazy continuation of a blockquote's paragraph is only allowed when
