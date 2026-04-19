@@ -1316,6 +1316,12 @@ type InlineSeg =
       // `]`, `](/url)`, `][label]`). Rendered verbatim when the segment
       // ends up unmatched.
       srcText: string
+      // Position (in the enclosing inline source string) of the first
+      // character AFTER the bracket marker (openers) or of the closing
+      // `]` (closers). Used to reconstruct raw label text for shortcut
+      // links, whose label must be matched with backslash escapes kept
+      // intact per the CommonMark label equality rule.
+      srcPos?: number
     }
 
 // Link reference definition — produced by extracting `[label]: url "title"`
@@ -1449,15 +1455,14 @@ function parseReferenceLabel(
   return { label, collapsed, end: j + 1 }
 }
 
-// normalizeLinkLabel applies the CommonMark label equality rule: decode
-// backslash escapes (this plugin uses decoded labels internally on both
-// sides of the comparison), strip leading/trailing whitespace, collapse
-// interior whitespace runs to a single space, and case-fold. The German
-// eszett (`ß`/`ẞ`) folds to `ss` via an explicit replacement since JS's
-// toLowerCase does not do full Unicode case-folding.
+// normalizeLinkLabel applies the CommonMark label equality rule: strip
+// leading/trailing whitespace, collapse interior whitespace runs to a
+// single space, and case-fold. Backslash escapes are preserved (so
+// `foo\!` ≠ `foo!`). The German eszett (`ß`/`ẞ`) folds to `ss` via an
+// explicit replacement since JS's toLowerCase does not do full Unicode
+// case-folding.
 function normalizeLinkLabel(s: string): string {
-  let out = decodeLinkText(s)
-  out = out.replace(/ẞ/g, 'ss').replace(/ß/g, 'ss')
+  let out = s.replace(/ẞ/g, 'ss').replace(/ß/g, 'ss')
   out = out.trim().toLowerCase().replace(/[ \t\r\n]+/g, ' ')
   return out
 }
@@ -1490,12 +1495,10 @@ function parseLinkRefDef(
       break
     }
     if (c === '\\' && i + 1 < text.length) {
-      // Drop the backslash so the stored label matches what the inline
-      // tokenizer's shortcut path builds (tokenizer decodes `\x` escapes
-      // into the escaped character). parseReferenceLabel keeps the raw
-      // backslash in the refLabel field, so the inline full-ref lookup
-      // normalizes by decoding its key in normalizeLinkLabel.
-      label += text[i + 1]
+      // Preserve the backslash so the stored label matches CommonMark's
+      // label equality rule, which treats `foo\!` and `foo!` as distinct
+      // labels (see spec example 545).
+      label += text[i] + text[i + 1]
       i += 2
       continue
     }
@@ -2019,6 +2022,7 @@ function tokenizeInline(s: string): InlineSeg[] {
         image: true,
         active: true,
         srcText: '![',
+        srcPos: i + 2,
       })
       i += 2
       continue
@@ -2032,6 +2036,7 @@ function tokenizeInline(s: string): InlineSeg[] {
         image: false,
         active: true,
         srcText: '[',
+        srcPos: i + 1,
       })
       i++
       continue
@@ -2051,6 +2056,7 @@ function tokenizeInline(s: string): InlineSeg[] {
           url: lt.url,
           title: lt.title,
           srcText: s.slice(i, lt.end),
+          srcPos: i,
         })
         i = lt.end
         continue
@@ -2065,6 +2071,7 @@ function tokenizeInline(s: string): InlineSeg[] {
           refLabel: rl.collapsed ? undefined : rl.label,
           refCollapsed: rl.collapsed,
           srcText: s.slice(i, rl.end),
+          srcPos: i,
         })
         i = rl.end
         continue
@@ -2076,6 +2083,7 @@ function tokenizeInline(s: string): InlineSeg[] {
         active: true,
         refShortcut: true,
         srcText: ']',
+        srcPos: i,
       })
       i++
       continue
@@ -2148,7 +2156,19 @@ function tokenizeInline(s: string): InlineSeg[] {
 function processLinks(
   segs: InlineSeg[],
   refs: LinkRefMap = NO_REFS,
+  src: string = '',
 ): InlineSeg[] {
+  // rawLabel extracts the original source text between an opener
+  // bracket and its matching closer `]`, used for shortcut reference
+  // matching where CommonMark preserves backslash escapes literally
+  // (so `[foo\!]` ≠ `[foo!]`).
+  const rawLabel = (op: Extract<InlineSeg, { kind: 'bracket' }>,
+                    cl: Extract<InlineSeg, { kind: 'bracket' }>): string => {
+    if (src && op.srcPos !== undefined && cl.srcPos !== undefined) {
+      return src.slice(op.srcPos, cl.srcPos)
+    }
+    return innerText(segs.slice(segs.indexOf(op) + 1, segs.indexOf(cl)))
+  }
   let i = 0
   while (i < segs.length) {
     const close = segs[i]
@@ -2193,8 +2213,9 @@ function processLinks(
           title = ref.title
         }
       } else if (close.refCollapsed) {
-        // Collapsed `[]` consumed by tokenizer; label is inner text.
-        const ref = refs[normalizeLinkLabel(innerText(inner))]
+        // Collapsed `[]` consumed by tokenizer; label is the raw text
+        // of the opener's `[...]` span.
+        const ref = refs[normalizeLinkLabel(rawLabel(open!, close))]
         if (ref) {
           url = ref.url
           title = ref.title
@@ -2206,7 +2227,7 @@ function processLinks(
         // label doesn't resolve, the shortcut is NOT tried.
         const la = scanFollowingBracketPair(segs, i + 1)
         if (la) {
-          const label = la.label !== '' ? la.label : innerText(inner)
+          const label = la.label !== '' ? la.label : rawLabel(open!, close)
           const ref = refs[normalizeLinkLabel(label)]
           if (ref) {
             url = ref.url
@@ -2217,8 +2238,8 @@ function processLinks(
           // url undefined — the outer `[text]` link fails and the
           // enclosed `[label]` segments remain for their own pass.
         } else {
-          // No follow-up: try shortcut with inner text as label.
-          const ref = refs[normalizeLinkLabel(innerText(inner))]
+          // No follow-up: try shortcut with raw label source text.
+          const ref = refs[normalizeLinkLabel(rawLabel(open!, close))]
           if (ref) {
             url = ref.url
             title = ref.title
@@ -2235,12 +2256,25 @@ function processLinks(
       // a failed full/collapsed ref releases its label for re-processing).
       if (close.refLabel !== undefined || close.refCollapsed) {
         const suffix = close.srcText.slice(1) // drop the leading `]`
+        // Remember the original closer position in `src` so we can
+        // shift the re-tokenized segments' `srcPos` fields to still
+        // refer into the outer source string (rawLabel slicing relies
+        // on that invariant).
+        const suffixStart =
+          close.srcPos !== undefined ? close.srcPos + 1 : -1
         close.refLabel = undefined
         close.refCollapsed = false
         close.refShortcut = true
         close.srcText = ']'
         if (suffix.length > 0) {
           const extra = tokenizeInline(suffix)
+          if (suffixStart >= 0) {
+            for (const s2 of extra) {
+              if (s2.kind === 'bracket' && s2.srcPos !== undefined) {
+                s2.srcPos += suffixStart
+              }
+            }
+          }
           segs.splice(i + 1, 0, ...extra)
         }
       }
@@ -2250,7 +2284,7 @@ function processLinks(
     }
 
     // Recursively process nested links then emphasis within link text.
-    const nested = processLinks(inner, refs)
+    const nested = processLinks(inner, refs, src)
     processEmphasis(nested)
 
     // At this point open must be non-null because url was resolved only
@@ -2400,7 +2434,7 @@ function renderSegments(segs: InlineSeg[]): string {
 //   - emphasis and strong (`*` / `_` delimiter runs)
 function renderInline(s: string, refs: LinkRefMap = NO_REFS): string {
   const segs = tokenizeInline(s)
-  processLinks(segs, refs)
+  processLinks(segs, refs, s)
   processEmphasis(segs)
   return renderSegments(segs)
 }

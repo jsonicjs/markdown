@@ -1546,6 +1546,12 @@ type inlineSeg struct {
 	// Original source text consumed for this bracket segment; rendered
 	// verbatim when the segment ends up unmatched.
 	srcText string
+	// Position (in the enclosing inline source string) of the first
+	// character after the bracket marker (openers) or of the closing
+	// `]` (closers). Used to reconstruct raw label text for shortcut
+	// links, whose label must be matched with backslash escapes kept
+	// intact per CommonMark's label equality rule. -1 means unset.
+	srcPos int
 }
 
 // LinkRef is a link reference definition extracted from the block list.
@@ -1764,7 +1770,8 @@ func parseReferenceLabel(s string, i int) (string, bool, int, bool) {
 // from parseReferenceLabel compare against decoded labels from
 // parseLinkRefDef.
 func normalizeLinkLabel(s string) string {
-	s = decodeLinkText(s)
+	// Backslash escapes are preserved (so `foo\!` ≠ `foo!`), per
+	// CommonMark's label equality rule — see spec example 545.
 	s = strings.ReplaceAll(s, "ẞ", "ss")
 	s = strings.ReplaceAll(s, "ß", "ss")
 	s = strings.TrimSpace(s)
@@ -1818,6 +1825,10 @@ func parseLinkRefDef(text string) (string, string, string, int, bool) {
 			break
 		}
 		if c == '\\' && i+1 < len(text) {
+			// Preserve the backslash so the stored label matches
+			// CommonMark's label equality rule, which treats `foo\!`
+			// and `foo!` as distinct labels (see spec example 545).
+			lb.WriteByte(text[i])
 			lb.WriteByte(text[i+1])
 			i += 2
 			continue
@@ -2360,6 +2371,7 @@ func tokenizeInline(s string) []*inlineSeg {
 				image:   true,
 				active:  true,
 				srcText: "![",
+				srcPos:  i + 2,
 			})
 			i += 2
 			continue
@@ -2373,6 +2385,7 @@ func tokenizeInline(s string) []*inlineSeg {
 				image:   false,
 				active:  true,
 				srcText: "[",
+				srcPos:  i + 1,
 			})
 			i++
 			continue
@@ -2390,6 +2403,7 @@ func tokenizeInline(s string) []*inlineSeg {
 					title:   title,
 					hasURL:  true,
 					srcText: s[i:end],
+					srcPos:  i,
 				})
 				i = end
 				continue
@@ -2402,6 +2416,7 @@ func tokenizeInline(s string) []*inlineSeg {
 					refCollapsed: collapsed,
 					hasRef:       true,
 					srcText:      s[i:end],
+					srcPos:       i,
 				}
 				if !collapsed {
 					seg.refLabel = label
@@ -2417,6 +2432,7 @@ func tokenizeInline(s string) []*inlineSeg {
 				refShortcut: true,
 				hasRef:      true,
 				srcText:     "]",
+				srcPos:      i,
 			})
 			i++
 			continue
@@ -2521,7 +2537,19 @@ func tokenizeInline(s string) []*inlineSeg {
 // closing bracket with the most recent active opener. Inline links
 // (carrying a parsed URL) resolve directly; reference-style brackets
 // resolve their label through the supplied refs map.
-func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
+func processLinks(segs []*inlineSeg, refs LinkRefMap, src string) []*inlineSeg {
+	// rawLabel extracts the original source text between an opener
+	// bracket and its matching closer `]`, used for shortcut/collapsed
+	// reference matching where CommonMark preserves backslash escapes
+	// literally (so `[foo\!]` ≠ `[foo!]`). Falls back to the decoded
+	// inner text when positions are unavailable.
+	rawLabel := func(op, cl *inlineSeg, inner []*inlineSeg) string {
+		if src != "" && op.srcPos >= 0 && cl.srcPos >= 0 &&
+			op.srcPos <= cl.srcPos && cl.srcPos <= len(src) {
+			return src[op.srcPos:cl.srcPos]
+		}
+		return innerText(inner)
+	}
 	i := 0
 	for i < len(segs) {
 		close := segs[i]
@@ -2562,7 +2590,7 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 					hasTarget = true
 				}
 			case close.refCollapsed && refs != nil:
-				if ref, ok := refs[normalizeLinkLabel(innerText(inner))]; ok {
+				if ref, ok := refs[normalizeLinkLabel(rawLabel(op, close, inner))]; ok {
 					url = ref.URL
 					title = ref.Title
 					hasTarget = true
@@ -2575,7 +2603,7 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 				if label, endIdx, ok := scanFollowingBracketPair(segs, i+1); ok {
 					useLabel := label
 					if label == "" {
-						useLabel = innerText(inner)
+						useLabel = rawLabel(op, close, inner)
 					}
 					if ref, ok2 := refs[normalizeLinkLabel(useLabel)]; ok2 {
 						url = ref.URL
@@ -2584,7 +2612,7 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 						consumeThrough = endIdx
 					}
 				} else {
-					if ref, ok := refs[normalizeLinkLabel(innerText(inner))]; ok {
+					if ref, ok := refs[normalizeLinkLabel(rawLabel(op, close, inner))]; ok {
 						url = ref.URL
 						title = ref.Title
 						hasTarget = true
@@ -2603,12 +2631,26 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 				if len(suffix) > 0 {
 					suffix = suffix[1:] // drop leading `]`
 				}
+				// Remember closer position in `src` so we can shift the
+				// re-tokenized segments' `srcPos` fields to still refer
+				// into the outer source string (rawLabel relies on it).
+				suffixStart := -1
+				if close.srcPos >= 0 {
+					suffixStart = close.srcPos + 1
+				}
 				close.refLabel = ""
 				close.refCollapsed = false
 				close.refShortcut = true
 				close.srcText = "]"
 				if len(suffix) > 0 {
 					extra := tokenizeInline(suffix)
+					if suffixStart >= 0 {
+						for _, s2 := range extra {
+							if s2.kind == segBracket && s2.srcPos >= 0 {
+								s2.srcPos += suffixStart
+							}
+						}
+					}
 					tail := append([]*inlineSeg{}, segs[i+1:]...)
 					segs = append(segs[:i+1], append(extra, tail...)...)
 				}
@@ -2620,7 +2662,7 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 			continue
 		}
 
-		inner = processLinks(inner, refs)
+		inner = processLinks(inner, refs, src)
 		inner = processEmphasis(inner)
 
 		var html string
@@ -2773,7 +2815,7 @@ func renderSegments(segs []*inlineSeg) string {
 // autolinks, raw HTML, emphasis and strong).
 func renderInline(s string, refs LinkRefMap) string {
 	segs := tokenizeInline(s)
-	segs = processLinks(segs, refs)
+	segs = processLinks(segs, refs, s)
 	segs = processEmphasis(segs)
 	return renderSegments(segs)
 }
