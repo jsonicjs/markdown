@@ -70,7 +70,7 @@
 
   rule: quote-tail: open: [
     { s: '#MQ' a: '@quote-append' r: quote-tail g: 'md,quote,more' }
-    { s: '#MT' a: '@quote-append' r: quote-tail g: 'md,quote,lazy' }
+    { s: '#MT' a: '@quote-append' r: quote-tail c: '@quote-lazy-ok' g: 'md,quote,lazy' }
     { g: 'md,quote,end' }
   ]
 
