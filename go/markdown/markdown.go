@@ -223,6 +223,10 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			meta := ensureMeta(ctx)
 			meta["mdCurrent"] = block
 			meta["mdCurrentMarkerId"], _ = v["markerId"].(string)
+			// Reset blank-tracking so a pending blank left over from a
+			// prior sibling list doesn't promote this list to loose.
+			meta["listPendingBlank"] = false
+			meta["listPendingBlanks"] = 0
 		}),
 
 		"@list-append": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -231,7 +235,6 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			prevMarker, _ := ctx.Meta["mdCurrentMarkerId"].(string)
 			newMarker, _ := v["markerId"].(string)
 			if newMarker != "" && newMarker != prevMarker {
-				// Different marker -> end current list, open a new one.
 				newBlock := map[string]any{
 					"type":    "list",
 					"ordered": v["ordered"],
@@ -246,11 +249,13 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				ctx.Meta["mdCurrent"] = newBlock
 				ctx.Meta["mdCurrentMarkerId"] = newMarker
 				ctx.Meta["listPendingBlank"] = false
+				ctx.Meta["listPendingBlanks"] = 0
 				return
 			}
 			if pending, _ := ctx.Meta["listPendingBlank"].(bool); pending {
 				cur["loose"] = true
 				ctx.Meta["listPendingBlank"] = false
+				ctx.Meta["listPendingBlanks"] = 0
 			}
 			items, _ := cur["items"].([]any)
 			cur["items"] = append(items, map[string]any{"text": v["text"]})
@@ -262,10 +267,13 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			items, _ := cur["items"].([]any)
 			last, _ := items[len(items)-1].(map[string]any)
 			text, _ := last["text"].(string)
-			if pending, _ := ctx.Meta["listPendingBlank"].(bool); pending {
+			pending, _ := ctx.Meta["listPendingBlank"].(bool)
+			pendingBlanks, _ := ctx.Meta["listPendingBlanks"].(int)
+			if pending {
 				cur["loose"] = true
-				last["text"] = text + "\n\n" + v
+				last["text"] = text + strings.Repeat("\n", pendingBlanks+1) + v
 				ctx.Meta["listPendingBlank"] = false
+				ctx.Meta["listPendingBlanks"] = 0
 			} else if text == "" {
 				last["text"] = v
 			} else {
@@ -274,7 +282,10 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 		}),
 
 		"@list-blank": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
-			ensureMeta(ctx)["listPendingBlank"] = true
+			meta := ensureMeta(ctx)
+			meta["listPendingBlank"] = true
+			cnt, _ := meta["listPendingBlanks"].(int)
+			meta["listPendingBlanks"] = cnt + 1
 		}),
 
 		"@quote-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {

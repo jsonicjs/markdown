@@ -202,9 +202,6 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
         ordered: v.ordered,
         items: [{ text: v.text }],
       }
-      // Store the marker identity as a non-enumerable property so it's
-      // used internally for list-break detection but invisible to the
-      // block-structure equality checks exposed to consumers.
       Object.defineProperty(block, '_markerId', {
         value: v.markerId,
         enumerable: false,
@@ -215,6 +212,10 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       }
       r.node.push(block)
       ctx.u.mdCurrent = block
+      // Reset blank-tracking so a pending blank left over from a prior
+      // sibling list doesn't spuriously promote this new list to loose.
+      ctx.u.listPendingBlank = false
+      ctx.u.listPendingBlanks = 0
     },
 
     '@list-append': (r: Rule, ctx: Context) => {
@@ -225,8 +226,6 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
         markerId?: string
       }
       const block = ctx.u.mdCurrent
-      // A marker-character change ends the current list and opens a new
-      // sibling list in the result array rather than appending.
       if (v.markerId !== undefined && v.markerId !== block._markerId) {
         const newBlock: any = {
           type: 'list',
@@ -244,11 +243,13 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
         r.node.push(newBlock)
         ctx.u.mdCurrent = newBlock
         ctx.u.listPendingBlank = false
+        ctx.u.listPendingBlanks = 0
         return
       }
       if (ctx.u.listPendingBlank) {
         block.loose = true
         ctx.u.listPendingBlank = false
+        ctx.u.listPendingBlanks = 0
       }
       block.items.push({ text: v.text })
     },
@@ -258,10 +259,15 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       const block = ctx.u.mdCurrent
       const items = block.items
       const last = items[items.length - 1]
+      const pendingBlanks = (ctx.u.listPendingBlanks as number) || 0
       if (ctx.u.listPendingBlank) {
         block.loose = true
-        last.text += '\n\n' + v
+        // Preserve the exact number of blank lines so nested code fences
+        // and other constructs in loose items render with the right
+        // internal spacing.
+        last.text += '\n'.repeat(pendingBlanks + 1) + v
         ctx.u.listPendingBlank = false
+        ctx.u.listPendingBlanks = 0
       } else if (last.text.length === 0) {
         last.text = v
       } else {
@@ -269,11 +275,13 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       }
     },
 
-    // A blank line inside a list flags pending-blank. If more list content
-    // follows, @list-append / @list-cont will promote the list to loose;
-    // otherwise the flag is simply discarded when the list ends.
+    // A blank line inside a list flags pending-blank and counts how many
+    // blanks have stacked up so a subsequent continuation preserves them
+    // verbatim in the item's accumulated text.
     '@list-blank': (_r: Rule, ctx: Context) => {
       ctx.u.listPendingBlank = true
+      ctx.u.listPendingBlanks =
+        ((ctx.u.listPendingBlanks as number) || 0) + 1
     },
 
     '@quote-start': (r: Rule, ctx: Context) => {
