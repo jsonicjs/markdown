@@ -994,10 +994,13 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				tkn = lex.Token("#MQ", tinFor(lex, "#MQ"), m[2], srcPart)
 				kind = "quote"
 
-			// Indented line (4+ spaces or tab): code block unless it
-			// continues a paragraph.
+			// Indented line (4+ spaces or tab): indented code block,
+			// unless we're currently inside a paragraph OR inside a
+			// list item accumulating a paragraph (lazy continuation).
 			case strings.HasPrefix(lineContent, "    ") || strings.HasPrefix(lineContent, "\t"):
-				if state.last == "text" {
+				if state.last == "text" ||
+					(state.listContentCol > 0 &&
+						(state.last == "list" || state.last == "listcont")) {
 					stripped := strings.TrimLeft(lineContent, " \t")
 					srcPart := src[sI:consumeEnd]
 					tkn = lex.Token("#MT", tinFor(lex, "#MT"), stripped, srcPart)

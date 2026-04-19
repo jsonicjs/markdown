@@ -831,10 +831,15 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       }
 
       // Indented line (4+ spaces or leading tab): indented code block,
-      // unless we're currently inside a paragraph (in which case it's
-      // paragraph continuation with leading whitespace stripped).
+      // unless we're currently inside a paragraph (paragraph
+      // continuation) or inside a list item that's still accumulating a
+      // paragraph — in which case this is a lazy continuation line.
       else if (/^(?:    |\t)/.test(lineContent)) {
-        if (state.last === 'text') {
+        if (
+          state.last === 'text' ||
+          (state.listContentCol > 0 &&
+            (state.last === 'list' || state.last === 'listcont'))
+        ) {
           const stripped = lineContent.replace(/^[ \t]+/, '')
           srcPart = src.substring(sI, consumeEnd)
           tkn = lex.token('#MT', stripped, srcPart, pnt)
