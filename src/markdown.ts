@@ -2337,6 +2337,16 @@ function processEmphasis(segs: InlineSeg[]): InlineSeg[] {
     const tag = useStrong ? 'strong' : 'em'
 
     const inner = segs.slice(matched + 1, i)
+    // Per CM rule 15, any delimiter segments that ended up inside this
+    // matched pair are removed from the delimiter stack — they can no
+    // longer match further closers. Their characters still render as
+    // literals via renderSegments.
+    for (const s2 of inner) {
+      if (s2.kind === 'delim') {
+        s2.canOpen = false
+        s2.canClose = false
+      }
+    }
     const replacement: InlineSeg[] = []
     op.length -= consume
     closer.length -= consume

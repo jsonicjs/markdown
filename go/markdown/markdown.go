@@ -2658,6 +2658,16 @@ func processEmphasis(segs []*inlineSeg) []*inlineSeg {
 		}
 
 		inner := append([]*inlineSeg{}, segs[matched+1:i]...)
+		// Per CM rule 15, any delimiter segments that ended up inside
+		// this matched pair are removed from the delimiter stack —
+		// they can no longer match further closers. Their characters
+		// still render as literals via renderSegments.
+		for _, s2 := range inner {
+			if s2.kind == segDelim {
+				s2.canOpen = false
+				s2.canClose = false
+			}
+		}
 		op.length -= consume
 		closer.length -= consume
 
