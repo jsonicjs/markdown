@@ -347,14 +347,25 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 		"@setext-promote": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(map[string]any)
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			// Strip leading link reference definitions from the
+			// paragraph text before forming the heading. If nothing
+			// remains, leave the block as a paragraph (it will likely
+			// be dropped later during ref extraction).
+			text, _ := cur["text"].(string)
+			for {
+				_, _, _, length, ok := parseLinkRefDef(text)
+				if !ok {
+					break
+				}
+				text = text[length:]
+			}
+			text = strings.TrimSpace(text)
+			if text == "" {
+				return
+			}
 			cur["type"] = "heading"
 			cur["level"] = v["level"]
-			if text, ok := cur["text"].(string); ok {
-				cur["text"] = strings.TrimSpace(text)
-			}
-			if emitHTML {
-				cur["html"] = RenderHTML(cur)
-			}
+			cur["text"] = text
 		}),
 
 		"@icode-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -1522,8 +1533,14 @@ func parseReferenceLabel(s string, i int) (string, bool, int, bool) {
 
 // normalizeLinkLabel applies CommonMark's label equality rule: strip
 // leading/trailing whitespace, collapse interior whitespace to single
-// spaces, case-fold via ToLower.
+// spaces, case-fold. The German eszett (`ß`/`ẞ`) folds to `ss` via an
+// explicit replacement. Backslash escapes are decoded so raw labels
+// from parseReferenceLabel compare against decoded labels from
+// parseLinkRefDef.
 func normalizeLinkLabel(s string) string {
+	s = decodeLinkText(s)
+	s = strings.ReplaceAll(s, "ẞ", "ss")
+	s = strings.ReplaceAll(s, "ß", "ss")
 	s = strings.TrimSpace(s)
 	s = strings.ToLower(s)
 	// Collapse any run of whitespace to a single space.

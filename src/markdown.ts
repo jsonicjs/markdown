@@ -330,10 +330,29 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     '@setext-promote': (_r: Rule, ctx: Context) => {
       const { level } = r_o0_val(_r) as { level: number }
       const block = ctx.u.mdCurrent
+      // Strip leading link reference definitions. Only what's left over
+      // becomes the heading's content. If nothing remains, convert the
+      // block into a synthetic paragraph containing the underline (so
+      // it renders as literal text instead of as an empty heading).
+      let text = block.text
+      while (true) {
+        const def = parseLinkRefDef(text)
+        if (!def) break
+        text = text.slice(def.length)
+      }
+      text = text.trim()
+      if (text.length === 0) {
+        // No heading content — paragraph promoted nothing. Leave block
+        // as a paragraph containing whatever original text was there.
+        // The setext underline line itself is already consumed from the
+        // token stream, so we can't include it here; the block simply
+        // remains a paragraph of its ref-def text (which will drop out
+        // later during ref extraction).
+        return
+      }
       block.type = 'heading'
       block.level = level
-      block.text = block.text.trim()
-      if (emitHtml) block.html = renderHtml(block)
+      block.text = text
     },
 
     '@icode-start': (r: Rule, ctx: Context) => {
@@ -1255,11 +1274,17 @@ function parseReferenceLabel(
   return { label, collapsed, end: j + 1 }
 }
 
-// normalizeLinkLabel applies the CommonMark label equality rule: strip
-// leading/trailing whitespace, collapse interior whitespace to single
-// spaces, case-fold via toLowerCase.
+// normalizeLinkLabel applies the CommonMark label equality rule: decode
+// backslash escapes (this plugin uses decoded labels internally on both
+// sides of the comparison), strip leading/trailing whitespace, collapse
+// interior whitespace runs to a single space, and case-fold. The German
+// eszett (`ß`/`ẞ`) folds to `ss` via an explicit replacement since JS's
+// toLowerCase does not do full Unicode case-folding.
 function normalizeLinkLabel(s: string): string {
-  return s.trim().toLowerCase().replace(/[ \t\r\n]+/g, ' ')
+  let out = decodeLinkText(s)
+  out = out.replace(/ẞ/g, 'ss').replace(/ß/g, 'ss')
+  out = out.trim().toLowerCase().replace(/[ \t\r\n]+/g, ' ')
+  return out
 }
 
 // parseLinkRefDef attempts to match a `[label]: destination[ "title"]`
@@ -1287,6 +1312,11 @@ function parseLinkRefDef(
       break
     }
     if (c === '\\' && i + 1 < text.length) {
+      // Drop the backslash so the stored label matches what the inline
+      // tokenizer's shortcut path builds (tokenizer decodes `\x` escapes
+      // into the escaped character). parseReferenceLabel keeps the raw
+      // backslash in the refLabel field, so the inline full-ref lookup
+      // normalizes by decoding its key in normalizeLinkLabel.
       label += text[i + 1]
       i += 2
       continue
