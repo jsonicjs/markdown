@@ -723,12 +723,14 @@ const (
 	segText inlineSegKind = iota
 	segHTML
 	segDelim
+	segBracket
 )
 
 // inlineSeg is a segment produced by the inline tokenizer. Text segments
 // need HTML-escaping at render time; HTML segments are already-safe HTML
 // atoms (code span output, decoded entities, escape output, hard breaks);
-// delim segments are `*`/`_` runs that the emphasis pass may consume.
+// delim segments are `*`/`_` runs that the emphasis pass may consume;
+// bracket segments are `[`, `![`, or `]` markers consumed by the link pass.
 type inlineSeg struct {
 	kind     inlineSegKind
 	value    string
@@ -736,6 +738,13 @@ type inlineSeg struct {
 	length   int
 	canOpen  bool
 	canClose bool
+	// Bracket-specific:
+	open   bool
+	image  bool
+	active bool
+	url    string
+	title  string
+	hasURL bool
 }
 
 // asciiPunct reports whether b is an ASCII punctuation character used by
@@ -752,10 +761,183 @@ func isInlineWS(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
+// parseLinkTarget parses `(URL[ "TITLE"])` starting at position i in s and
+// returns (url, title, end, true) on success.
+func parseLinkTarget(s string, i int) (string, string, int, bool) {
+	if i >= len(s) || s[i] != '(' {
+		return "", "", 0, false
+	}
+	j := i + 1
+	for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+		j++
+	}
+
+	var urlB strings.Builder
+	if j < len(s) && s[j] == '<' {
+		k := j + 1
+		for k < len(s) && s[k] != '>' && s[k] != '<' && s[k] != '\n' {
+			if s[k] == '\\' && k+1 < len(s) {
+				urlB.WriteByte(s[k+1])
+				k += 2
+				continue
+			}
+			urlB.WriteByte(s[k])
+			k++
+		}
+		if k >= len(s) || s[k] != '>' {
+			return "", "", 0, false
+		}
+		j = k + 1
+	} else {
+		depth := 0
+		for j < len(s) {
+			c := s[j]
+			if c == '\\' && j+1 < len(s) {
+				urlB.WriteByte(s[j+1])
+				j += 2
+				continue
+			}
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+				break
+			}
+			if c == '(' {
+				depth++
+			} else if c == ')' {
+				if depth == 0 {
+					break
+				}
+				depth--
+			} else if c < 0x20 || c == 0x7f {
+				break
+			}
+			urlB.WriteByte(c)
+			j++
+		}
+		if urlB.Len() == 0 && (j >= len(s) || s[j] != ')') {
+			return "", "", 0, false
+		}
+	}
+
+	for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+		j++
+	}
+
+	var titleB strings.Builder
+	if j < len(s) && (s[j] == '"' || s[j] == '\'' || s[j] == '(') {
+		openQ := s[j]
+		closeQ := openQ
+		if openQ == '(' {
+			closeQ = ')'
+		}
+		k := j + 1
+		for k < len(s) && s[k] != closeQ {
+			if s[k] == '\\' && k+1 < len(s) {
+				titleB.WriteByte(s[k+1])
+				k += 2
+				continue
+			}
+			titleB.WriteByte(s[k])
+			k++
+		}
+		if k >= len(s) || s[k] != closeQ {
+			return "", "", 0, false
+		}
+		j = k + 1
+	}
+
+	for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+		j++
+	}
+
+	if j >= len(s) || s[j] != ')' {
+		return "", "", 0, false
+	}
+	return urlB.String(), titleB.String(), j + 1, true
+}
+
+var reLooseAmp = regexp.MustCompile(`&(?:#x?[0-9a-fA-F]+;|[a-zA-Z][a-zA-Z0-9]*;)`)
+
+// encodeLinkUrl applies minimal URL normalization for href/src attributes.
+func encodeLinkUrl(url string) string {
+	// Preserve well-formed entities; escape bare `&`.
+	// Simple pass: replace `&` not part of an entity with `&amp;`.
+	out := ""
+	i := 0
+	for i < len(url) {
+		c := url[i]
+		if c == '&' {
+			m := reLooseAmp.FindStringIndex(url[i:])
+			if m != nil && m[0] == 0 {
+				out += url[i : i+m[1]]
+				i += m[1]
+				continue
+			}
+			out += "&amp;"
+			i++
+			continue
+		}
+		switch c {
+		case '<':
+			out += "&lt;"
+		case '>':
+			out += "&gt;"
+		case '"':
+			out += "%22"
+		case ' ':
+			out += "%20"
+		default:
+			out += string(c)
+		}
+		i++
+	}
+	return out
+}
+
+// innerText extracts a best-effort plain-text rendering of a segment list,
+// used as alt text for images.
+func innerText(segs []*inlineSeg) string {
+	var b strings.Builder
+	for _, s := range segs {
+		switch s.kind {
+		case segText:
+			b.WriteString(s.value)
+		case segDelim:
+			b.WriteString(strings.Repeat(string(s.char), s.length))
+		case segBracket:
+			if s.open {
+				if s.image {
+					b.WriteString("![")
+				} else {
+					b.WriteString("[")
+				}
+			} else {
+				b.WriteString("]")
+			}
+		case segHTML:
+			// Strip tags, keep text content.
+			stripped := s.value
+			for {
+				lt := strings.IndexByte(stripped, '<')
+				if lt < 0 {
+					b.WriteString(stripped)
+					break
+				}
+				b.WriteString(stripped[:lt])
+				gt := strings.IndexByte(stripped[lt:], '>')
+				if gt < 0 {
+					break
+				}
+				stripped = stripped[lt+gt+1:]
+			}
+		}
+	}
+	return b.String()
+}
+
 // tokenizeInline produces a flat segment list. Code spans, entity refs,
 // backslash escapes, and hard breaks are resolved into HTML segments;
 // plain text accumulates into text segments; runs of `*`/`_` are classified
-// and emitted as delim segments for the emphasis pass.
+// and emitted as delim segments; `[`, `![`, and `]` become bracket segments.
 func tokenizeInline(s string) []*inlineSeg {
 	segs := []*inlineSeg{}
 	appendText := func(t string) {
@@ -846,6 +1028,54 @@ func tokenizeInline(s string) []*inlineSeg {
 			}
 		}
 
+		// Image open `![`.
+		if c == '!' && i+1 < n && s[i+1] == '[' {
+			segs = append(segs, &inlineSeg{
+				kind:   segBracket,
+				open:   true,
+				image:  true,
+				active: true,
+			})
+			i += 2
+			continue
+		}
+
+		// Link open `[`.
+		if c == '[' {
+			segs = append(segs, &inlineSeg{
+				kind:   segBracket,
+				open:   true,
+				image:  false,
+				active: true,
+			})
+			i++
+			continue
+		}
+
+		// Link close `]` — if followed by `(url[ "title"])`, consume and
+		// stash the parsed target on the bracket segment.
+		if c == ']' {
+			if url, title, end, ok := parseLinkTarget(s, i+1); ok {
+				segs = append(segs, &inlineSeg{
+					kind:   segBracket,
+					open:   false,
+					active: true,
+					url:    url,
+					title:  title,
+					hasURL: true,
+				})
+				i = end
+			} else {
+				segs = append(segs, &inlineSeg{
+					kind:   segBracket,
+					open:   false,
+					active: true,
+				})
+				i++
+			}
+			continue
+		}
+
 		// Emphasis delimiter run.
 		if c == '*' || c == '_' {
 			length := 1
@@ -908,6 +1138,75 @@ func tokenizeInline(s string) []*inlineSeg {
 		i++
 	}
 
+	return segs
+}
+
+// processLinks walks the segment list forward, matching each link/image
+// closing bracket (that carries a parsed inline URL) with the most recent
+// active opener, and replacing the span with a single html segment
+// wrapping the rendered inner content in an <a> or <img> element.
+func processLinks(segs []*inlineSeg) []*inlineSeg {
+	i := 0
+	for i < len(segs) {
+		close := segs[i]
+		if close.kind != segBracket || close.open || !close.hasURL {
+			i++
+			continue
+		}
+
+		openIdx := -1
+		for j := i - 1; j >= 0; j-- {
+			op := segs[j]
+			if op.kind == segBracket && op.open && op.active {
+				openIdx = j
+				break
+			}
+		}
+		if openIdx < 0 {
+			i++
+			continue
+		}
+
+		op := segs[openIdx]
+		inner := append([]*inlineSeg{}, segs[openIdx+1:i]...)
+		inner = processLinks(inner)
+		inner = processEmphasis(inner)
+
+		var html string
+		if op.image {
+			alt := innerText(inner)
+			titleAttr := ""
+			if close.title != "" {
+				titleAttr = ` title="` + escapeHTMLString(close.title) + `"`
+			}
+			html = `<img src="` + encodeLinkUrl(close.url) + `" alt="` +
+				escapeHTMLString(alt) + `"` + titleAttr + " />"
+		} else {
+			inside := renderSegments(inner)
+			titleAttr := ""
+			if close.title != "" {
+				titleAttr = ` title="` + escapeHTMLString(close.title) + `"`
+			}
+			html = `<a href="` + encodeLinkUrl(close.url) + `"` + titleAttr +
+				">" + inside + "</a>"
+		}
+
+		replacement := &inlineSeg{kind: segHTML, value: html}
+		tail := append([]*inlineSeg{}, segs[i+1:]...)
+		segs = append(segs[:openIdx], append([]*inlineSeg{replacement}, tail...)...)
+
+		// Deactivate all earlier link openers to prevent nested links.
+		if !op.image {
+			for k := 0; k < openIdx; k++ {
+				s2 := segs[k]
+				if s2.kind == segBracket && s2.open && !s2.image {
+					s2.active = false
+				}
+			}
+		}
+
+		i = openIdx + 1
+	}
 	return segs
 }
 
@@ -983,8 +1282,8 @@ func processEmphasis(segs []*inlineSeg) []*inlineSeg {
 	return segs
 }
 
-// renderSegments produces the final HTML string. Leftover delim segments
-// (unmatched) are rendered as literal characters.
+// renderSegments produces the final HTML string. Leftover delim and
+// bracket segments (unmatched) are rendered as their literal characters.
 func renderSegments(segs []*inlineSeg) string {
 	var b strings.Builder
 	for _, s := range segs {
@@ -995,6 +1294,16 @@ func renderSegments(segs []*inlineSeg) string {
 			b.WriteString(s.value)
 		case segDelim:
 			b.WriteString(escapeHTMLString(strings.Repeat(string(s.char), s.length)))
+		case segBracket:
+			if s.open {
+				if s.image {
+					b.WriteString(escapeHTMLString("!["))
+				} else {
+					b.WriteString(escapeHTMLString("["))
+				}
+			} else {
+				b.WriteString(escapeHTMLString("]"))
+			}
 		}
 	}
 	return b.String()
@@ -1005,10 +1314,12 @@ func renderSegments(segs []*inlineSeg) string {
 //   - entity / numeric character references
 //   - hard line breaks
 //   - code spans
+//   - inline links `[text](url "title")` and images `![alt](url "title")`
 //   - emphasis and strong (`*` / `_` delimiter runs)
-// Links, images, autolinks, and raw HTML are not yet implemented.
+// Reference-style links, autolinks, and raw HTML are not yet implemented.
 func renderInline(s string) string {
 	segs := tokenizeInline(s)
+	segs = processLinks(segs)
 	segs = processEmphasis(segs)
 	return renderSegments(segs)
 }

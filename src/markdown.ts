@@ -609,7 +609,8 @@ function decodeEntity(ref: string): string | null {
 // InlineSeg is a segment produced by the inline tokenizer. Text segments
 // need HTML-escaping at render time; html segments are already-safe HTML
 // atoms (code span output, decoded entities, escape output, hard breaks);
-// delim segments are `*`/`_` runs that the emphasis pass may consume.
+// delim segments are `*`/`_` runs that the emphasis pass may consume;
+// bracket segments are `[`, `![`, or `]` markers consumed by the link pass.
 type InlineSeg =
   | { kind: 'text'; value: string }
   | { kind: 'html'; value: string }
@@ -620,6 +621,14 @@ type InlineSeg =
       canOpen: boolean
       canClose: boolean
     }
+  | {
+      kind: 'bracket'
+      open: boolean
+      image: boolean
+      active: boolean
+      url?: string
+      title?: string
+    }
 
 // ASCII punctuation used for CommonMark flanking classification. The full
 // spec uses Unicode punctuation; this is a close ASCII approximation.
@@ -629,11 +638,123 @@ function isWhitespaceChar(c: string): boolean {
   return c === '' || c === ' ' || c === '\t' || c === '\n' || c === '\r'
 }
 
+// parseLinkTarget parses `(URL[ "TITLE"])` starting at position i in s and
+// returns { url, title, end } on success, or null if the string at i is not
+// a valid inline link target.
+function parseLinkTarget(
+  s: string,
+  i: number,
+): { url: string; title: string; end: number } | null {
+  if (s[i] !== '(') return null
+  let j = i + 1
+
+  // Optional whitespace (including one newline).
+  while (j < s.length && /[ \t\r\n]/.test(s[j])) j++
+
+  let url = ''
+  if (s[j] === '<') {
+    let k = j + 1
+    while (
+      k < s.length &&
+      s[k] !== '>' &&
+      s[k] !== '<' &&
+      s[k] !== '\n'
+    ) {
+      if (s[k] === '\\' && k + 1 < s.length) {
+        url += s[k + 1]
+        k += 2
+        continue
+      }
+      url += s[k]
+      k++
+    }
+    if (s[k] !== '>') return null
+    j = k + 1
+  } else {
+    let depth = 0
+    while (j < s.length) {
+      const c = s[j]
+      if (c === '\\' && j + 1 < s.length) {
+        url += s[j + 1]
+        j += 2
+        continue
+      }
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') break
+      if (c === '(') {
+        depth++
+      } else if (c === ')') {
+        if (depth === 0) break
+        depth--
+      } else if (c.charCodeAt(0) < 0x20 || c === '\x7f') {
+        break
+      }
+      url += c
+      j++
+    }
+    if (url.length === 0 && s[j] !== ')') return null
+  }
+
+  while (j < s.length && /[ \t\r\n]/.test(s[j])) j++
+
+  let title = ''
+  if (s[j] === '"' || s[j] === "'" || s[j] === '(') {
+    const openQ = s[j]
+    const closeQ = openQ === '(' ? ')' : openQ
+    let k = j + 1
+    while (k < s.length && s[k] !== closeQ) {
+      if (s[k] === '\\' && k + 1 < s.length) {
+        title += s[k + 1]
+        k += 2
+        continue
+      }
+      title += s[k]
+      k++
+    }
+    if (s[k] !== closeQ) return null
+    j = k + 1
+  }
+
+  while (j < s.length && /[ \t\r\n]/.test(s[j])) j++
+
+  if (s[j] !== ')') return null
+  return { url, title, end: j + 1 }
+}
+
+// encodeLinkUrl applies a minimal URL normalization to the destination URL:
+// only `&`, `<`, `>`, `"`, and ` ` are replaced, matching the subset of
+// CommonMark's full percent-encoding that most spec tests exercise.
+function encodeLinkUrl(url: string): string {
+  return url
+    .replace(/&(?!#x?[0-9a-fA-F]+;|[a-zA-Z][a-zA-Z0-9]+;)/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '%22')
+    .replace(/ /g, '%20')
+}
+
+// innerText extracts a best-effort plain-text rendering of a segment list,
+// used as alt text for images. Nested markup is stripped.
+function innerText(segs: InlineSeg[]): string {
+  let out = ''
+  for (const seg of segs) {
+    if (seg.kind === 'text') out += seg.value
+    else if (seg.kind === 'delim') out += seg.char.repeat(seg.length)
+    else if (seg.kind === 'bracket') {
+      out += seg.open ? (seg.image ? '![' : '[') : ']'
+    } else {
+      // html segment: strip tags, keep textual content
+      out += seg.value.replace(/<[^>]*>/g, '')
+    }
+  }
+  return out
+}
+
 // tokenizeInline walks the input and produces a flat segment list. Code
 // spans, entity refs, backslash escapes, and hard breaks are resolved into
 // `html` segments; plain text accumulates into `text` segments; runs of
 // `*`/`_` are classified and emitted as `delim` segments for the emphasis
-// pass to consume.
+// pass to consume; `[`, `![`, and `]` become `bracket` segments for the
+// link pass.
 function tokenizeInline(s: string): InlineSeg[] {
   const segs: InlineSeg[] = []
   const appendText = (t: string) => {
@@ -724,6 +845,56 @@ function tokenizeInline(s: string): InlineSeg[] {
       }
     }
 
+    // Image open `![`.
+    if (c === '!' && s[i + 1] === '[') {
+      segs.push({
+        kind: 'bracket',
+        open: true,
+        image: true,
+        active: true,
+      })
+      i += 2
+      continue
+    }
+
+    // Link open `[`.
+    if (c === '[') {
+      segs.push({
+        kind: 'bracket',
+        open: true,
+        image: false,
+        active: true,
+      })
+      i++
+      continue
+    }
+
+    // Link close `]` — if followed by `(url[ "title"])`, consume it and
+    // stash the parsed target on the bracket segment for the link pass.
+    if (c === ']') {
+      const lt = parseLinkTarget(s, i + 1)
+      if (lt) {
+        segs.push({
+          kind: 'bracket',
+          open: false,
+          image: false,
+          active: true,
+          url: lt.url,
+          title: lt.title,
+        })
+        i = lt.end
+      } else {
+        segs.push({
+          kind: 'bracket',
+          open: false,
+          image: false,
+          active: true,
+        })
+        i++
+      }
+      continue
+    }
+
     // Emphasis delimiter run.
     if (c === '*' || c === '_') {
       let length = 1
@@ -772,6 +943,85 @@ function tokenizeInline(s: string): InlineSeg[] {
     i++
   }
 
+  return segs
+}
+
+// processLinks walks the segment list forward, matching each link/image
+// closing bracket with the most recent active opener. For inline links
+// (closer carries a parsed url), the enclosed segments are processed
+// recursively (emphasis + nested links) and the whole `[...]( )` span is
+// replaced by a single html segment wrapping the rendered inner text in an
+// `<a>` or `<img>` element.
+function processLinks(segs: InlineSeg[]): InlineSeg[] {
+  let i = 0
+  while (i < segs.length) {
+    const close = segs[i]
+    if (
+      close.kind !== 'bracket' ||
+      close.open ||
+      close.url === undefined
+    ) {
+      i++
+      continue
+    }
+
+    let j = i - 1
+    let openIdx = -1
+    while (j >= 0) {
+      const op = segs[j]
+      if (op.kind === 'bracket' && op.open && op.active) {
+        openIdx = j
+        break
+      }
+      j--
+    }
+
+    if (openIdx < 0) {
+      i++
+      continue
+    }
+
+    const open = segs[openIdx] as Extract<InlineSeg, { kind: 'bracket' }>
+    const inner = segs.slice(openIdx + 1, i)
+    // Recursively process nested links then emphasis within link text.
+    const nested = processLinks(inner)
+    processEmphasis(nested)
+
+    let html: string
+    if (open.image) {
+      const alt = innerText(nested)
+      const titleAttr = close.title
+        ? ` title="${escapeHtmlString(close.title)}"`
+        : ''
+      html = `<img src="${encodeLinkUrl(close.url!)}" alt="${escapeHtmlString(
+        alt,
+      )}"${titleAttr} />`
+    } else {
+      const inside = renderSegments(nested)
+      const titleAttr = close.title
+        ? ` title="${escapeHtmlString(close.title)}"`
+        : ''
+      html = `<a href="${encodeLinkUrl(close.url!)}"${titleAttr}>${inside}</a>`
+    }
+
+    segs.splice(openIdx, i - openIdx + 1, {
+      kind: 'html',
+      value: html,
+    })
+
+    // Per CommonMark, matching a link deactivates all earlier `[` openers
+    // to prevent nested <a> elements. (Images may still be nested.)
+    if (!open.image) {
+      for (let k = 0; k < openIdx; k++) {
+        const s2 = segs[k]
+        if (s2.kind === 'bracket' && s2.open && !s2.image) {
+          s2.active = false
+        }
+      }
+    }
+
+    i = openIdx + 1
+  }
   return segs
 }
 
@@ -841,14 +1091,23 @@ function processEmphasis(segs: InlineSeg[]): InlineSeg[] {
   return segs
 }
 
-// renderSegments produces the final HTML string. Leftover delim segments
-// (unmatched) are rendered as literal characters.
+// renderSegments produces the final HTML string. Leftover delim and
+// bracket segments (unmatched) are rendered as their literal characters.
 function renderSegments(segs: InlineSeg[]): string {
   let out = ''
   for (const seg of segs) {
-    if (seg.kind === 'text') out += escapeHtmlString(seg.value)
-    else if (seg.kind === 'html') out += seg.value
-    else out += escapeHtmlString(seg.char.repeat(seg.length))
+    if (seg.kind === 'text') {
+      out += escapeHtmlString(seg.value)
+    } else if (seg.kind === 'html') {
+      out += seg.value
+    } else if (seg.kind === 'delim') {
+      out += escapeHtmlString(seg.char.repeat(seg.length))
+    } else {
+      // bracket
+      out += escapeHtmlString(
+        seg.open ? (seg.image ? '![' : '[') : ']',
+      )
+    }
   }
   return out
 }
@@ -858,10 +1117,12 @@ function renderSegments(segs: InlineSeg[]): string {
 //   - entity / numeric character references
 //   - hard line breaks (2+ trailing spaces before \n, or backslash before \n)
 //   - code spans (`...`)
+//   - inline links `[text](url "title")` and images `![alt](url "title")`
 //   - emphasis and strong (`*` / `_` delimiter runs)
-// Links, images, autolinks, and raw HTML are not yet implemented.
+// Reference-style links, autolinks, and raw HTML are not yet implemented.
 function renderInline(s: string): string {
   const segs = tokenizeInline(s)
+  processLinks(segs)
   processEmphasis(segs)
   return renderSegments(segs)
 }
