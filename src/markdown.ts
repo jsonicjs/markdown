@@ -1553,7 +1553,8 @@ function utf8Bytes(c: string): number[] {
 }
 
 // innerText extracts a best-effort plain-text rendering of a segment list,
-// used as alt text for images. Nested markup is stripped.
+// used as alt text for images. Nested markup is stripped; a nested `<img>`
+// contributes its alt attribute.
 function innerText(segs: InlineSeg[]): string {
   let out = ''
   for (const seg of segs) {
@@ -1562,8 +1563,11 @@ function innerText(segs: InlineSeg[]): string {
     else if (seg.kind === 'bracket') {
       out += seg.open ? (seg.image ? '![' : '[') : ']'
     } else {
-      // html segment: strip tags, keep textual content
-      out += seg.value.replace(/<[^>]*>/g, '')
+      // html segment — strip tags but pull `alt="..."` from `<img>` so
+      // nested images contribute their alt text to the outer alt.
+      let v = seg.value
+      v = v.replace(/<img\s[^>]*\balt="([^"]*)"[^>]*>/g, '$1')
+      out += v.replace(/<[^>]*>/g, '')
     }
   }
   return out
@@ -1709,7 +1713,7 @@ function tokenizeInline(s: string): InlineSeg[] {
       }
 
       // Raw HTML: open tag, close tag, comment, PI, declaration, CDATA.
-      m = rest.match(/^<!--(?:[^-]|-[^-]|--[^>])*?-->/)
+      m = rest.match(/^<!--(?:-?>|(?:[^-]|-[^-]|--[^>])*?-->)/)
       if (m) {
         segs.push({ kind: 'html', value: m[0] })
         i += m[0].length
@@ -1851,7 +1855,9 @@ function tokenizeInline(s: string): InlineSeg[] {
       continue
     }
 
-    // Hard line break via 2+ trailing spaces.
+    // Hard line break via 2+ trailing spaces, or plain newline. A single
+    // trailing space (or trailing tabs) before a newline is insignificant
+    // per CommonMark — strip it before emitting the newline.
     if (c === '\n') {
       const last = segs[segs.length - 1]
       if (last && last.kind === 'text' && /  $/.test(last.value)) {
@@ -1860,6 +1866,10 @@ function tokenizeInline(s: string): InlineSeg[] {
         segs.push({ kind: 'html', value: '<br />\n' })
         i++
         continue
+      }
+      if (last && last.kind === 'text' && /[ \t]$/.test(last.value)) {
+        last.value = last.value.replace(/[ \t]+$/, '')
+        if (last.value.length === 0) segs.pop()
       }
       appendText('\n')
       i++

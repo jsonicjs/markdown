@@ -1238,7 +1238,7 @@ var (
 	reAutolinkEmail = regexp.MustCompile(
 		`^<([a-zA-Z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)>`,
 	)
-	reHTMLComment = regexp.MustCompile(`^<!--(?s:.)*?-->`)
+	reHTMLComment = regexp.MustCompile(`^<!--(?:-?>|(?s:.)*?-->)`)
 	reHTMLPI      = regexp.MustCompile(`^<\?(?s:.)*?\?>`)
 	reHTMLCDATA   = regexp.MustCompile(`^<!\[CDATA\[(?s:.)*?\]\]>`)
 	reHTMLDecl    = regexp.MustCompile(`^<![A-Z][^>]*>`)
@@ -1896,8 +1896,9 @@ func innerText(segs []*inlineSeg) string {
 				b.WriteString("]")
 			}
 		case segHTML:
-			// Strip tags, keep text content.
-			stripped := s.value
+			// Strip tags, but pull `alt="..."` from `<img>` so nested
+			// images contribute their alt text to the outer alt.
+			stripped := reImgAltAttr.ReplaceAllString(s.value, "$1")
 			for {
 				lt := strings.IndexByte(stripped, '<')
 				if lt < 0 {
@@ -1915,6 +1916,8 @@ func innerText(segs []*inlineSeg) string {
 	}
 	return b.String()
 }
+
+var reImgAltAttr = regexp.MustCompile(`<img\s[^>]*\balt="([^"]*)"[^>]*>`)
 
 // tokenizeInline produces a flat segment list. Code spans, entity refs,
 // backslash escapes, and hard breaks are resolved into HTML segments;
@@ -2176,7 +2179,9 @@ func tokenizeInline(s string) []*inlineSeg {
 			continue
 		}
 
-		// Hard line break via 2+ trailing spaces.
+		// Hard line break via 2+ trailing spaces, or plain newline. A
+		// single trailing space/tab before a newline is insignificant per
+		// CommonMark — strip it before emitting the newline.
 		if c == '\n' {
 			if len(segs) > 0 {
 				last := segs[len(segs)-1]
@@ -2188,6 +2193,13 @@ func tokenizeInline(s string) []*inlineSeg {
 					segs = append(segs, &inlineSeg{kind: segHTML, value: "<br />\n"})
 					i++
 					continue
+				}
+				if last.kind == segText &&
+					(strings.HasSuffix(last.value, " ") || strings.HasSuffix(last.value, "\t")) {
+					last.value = strings.TrimRight(last.value, " \t")
+					if last.value == "" {
+						segs = segs[:len(segs)-1]
+					}
 				}
 			}
 			appendText("\n")
