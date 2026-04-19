@@ -684,6 +684,22 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         kind = 'hr'
       }
 
+      // List item continuation at the active list's content column.
+      // Runs BEFORE the list-marker checks so a line like `  - b` after
+      // `- a` (content column 2) attaches as continuation text of item
+      // `a` rather than opening a new top-level list entry. The sub-parse
+      // of the item's accumulated text then forms the nested list.
+      else if (
+        state.listContentCol > 0 &&
+        lineContent.length >= state.listContentCol &&
+        lineContent.slice(0, state.listContentCol).trim() === ''
+      ) {
+        const stripped = lineContent.slice(state.listContentCol)
+        srcPart = src.substring(sI, consumeEnd)
+        tkn = lex.token('#MLC', stripped, srcPart, pnt)
+        kind = 'listcont'
+      }
+
       // Ordered list item. CommonMark limits the marker to 1-9 digits, and
       // an ordered list can only interrupt a paragraph when its first
       // item has start == 1.
@@ -767,21 +783,6 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
           pnt,
         )
         kind = 'list'
-      }
-
-      // Indented continuation of the current list item. Must come after
-      // the list-marker checks so a new item starts a new list entry
-      // rather than silently appending to the previous one.
-      else if (
-        state.listContentCol > 0 &&
-        lineContent.length >= state.listContentCol &&
-        /^ +/.test(lineContent.slice(0, state.listContentCol)) &&
-        lineContent.slice(0, state.listContentCol).trim() === ''
-      ) {
-        const stripped = lineContent.slice(state.listContentCol)
-        srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#MLC', stripped, srcPart, pnt)
-        kind = 'listcont'
       }
 
       // Blockquote line. CommonMark allows up to 3 leading spaces before
@@ -948,6 +949,15 @@ function renderListItem(
   if (parts.length === 0) return `<li></li>`
   if (!loose && parts.length === 1 && !parts[0].startsWith('<')) {
     return `<li>${parts[0]}</li>`
+  }
+  // If the first part is inline text from a tight paragraph, keep it
+  // flush with the `<li>` open tag (no leading newline) to match
+  // CommonMark's `<li>a\n<ul>...` shape. Subsequent parts still get a
+  // leading `\n` separator.
+  const firstInline = !loose && parts[0] && !parts[0].startsWith('<')
+  if (firstInline) {
+    const rest = parts.slice(1).join('\n')
+    return `<li>${parts[0]}\n${rest}\n</li>`
   }
   return `<li>\n${parts.join('\n')}\n</li>`
 }

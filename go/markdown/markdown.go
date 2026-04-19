@@ -464,6 +464,13 @@ func renderListItem(text string, loose bool, refs LinkRefMap) string {
 	if !loose && len(parts) == 1 && (len(parts[0]) == 0 || parts[0][0] != '<') {
 		return "<li>" + parts[0] + "</li>"
 	}
+	// If the first part is inline text from a tight paragraph, keep it
+	// flush with the `<li>` open tag (no leading newline).
+	firstInline := !loose && len(parts) > 0 && (len(parts[0]) == 0 || parts[0][0] != '<')
+	if firstInline {
+		rest := strings.Join(parts[1:], "\n")
+		return "<li>" + parts[0] + "\n" + rest + "\n</li>"
+	}
 	return "<li>\n" + strings.Join(parts, "\n") + "\n</li>"
 }
 
@@ -872,6 +879,18 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				tkn = lex.Token("#MR", tinFor(lex, "#MR"), nil, srcPart)
 				kind = "hr"
 
+			// List item continuation at the active list's content column.
+			// Runs BEFORE the list-marker checks so a deeper-indented
+			// marker attaches as continuation text and the sub-parse
+			// of the item forms the nested list.
+			case state.listContentCol > 0 &&
+				len(lineContent) >= state.listContentCol &&
+				strings.TrimLeft(lineContent[:state.listContentCol], " ") == "":
+				stripped := lineContent[state.listContentCol:]
+				srcPart := src[sI:consumeEnd]
+				tkn = lex.Token("#MLC", tinFor(lex, "#MLC"), stripped, srcPart)
+				kind = "listcont"
+
 			// Ordered list item. An ordered list can only interrupt a
 			// paragraph with start == 1.
 			case reOrderedFull.MatchString(lineContent) &&
@@ -936,15 +955,6 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
-
-			// Indented continuation of the current list item.
-			case state.listContentCol > 0 &&
-				len(lineContent) >= state.listContentCol &&
-				strings.TrimLeft(lineContent[:state.listContentCol], " ") == "":
-				stripped := lineContent[state.listContentCol:]
-				srcPart := src[sI:consumeEnd]
-				tkn = lex.Token("#MLC", tinFor(lex, "#MLC"), stripped, srcPart)
-				kind = "listcont"
 
 			// Blockquote line.
 			case reBlockquote.MatchString(lineContent):

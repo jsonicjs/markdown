@@ -25,8 +25,8 @@ import (
 
 // minCommonMarkPasses is the regression floor. Bump upward as the parser
 // improves; never decrease without an explanation in the commit.
-// Current baseline: 591/652 (step 22: list pending-blank count + tight reset).
-const minCommonMarkPasses = 586
+// Current baseline: 598/652 (step 23: nested list + tight first-inline).
+const minCommonMarkPasses = 593
 
 type commonMarkCase struct {
 	Markdown  string `json:"markdown"`
