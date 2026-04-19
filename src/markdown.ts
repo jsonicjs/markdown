@@ -194,24 +194,20 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
         ordered: v.ordered,
         items: [{ text: v.text }],
       }
-      if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
       ctx.u.mdCurrent = block
+      // HTML deferred — list rendering sub-parses each item and must
+      // not re-enter during the outer parse.
     },
 
     '@list-append': (r: Rule, ctx: Context) => {
       const v = r.o0.val as { ordered: boolean; text: string }
       const block = ctx.u.mdCurrent
-      // Only blanks that are followed by more list content (item or
-      // continuation) actually upgrade the list to loose. This check
-      // happens here because we now know the blank didn't terminate
-      // the list.
       if (ctx.u.listPendingBlank) {
         block.loose = true
         ctx.u.listPendingBlank = false
       }
       block.items.push({ text: v.text })
-      if (emitHtml) block.html = renderHtml(block)
     },
 
     '@list-cont': (r: Rule, ctx: Context) => {
@@ -221,8 +217,6 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       const last = items[items.length - 1]
       if (ctx.u.listPendingBlank) {
         block.loose = true
-        // Preserve a paragraph break in the raw item text so the renderer
-        // can split loose items into their constituent paragraphs.
         last.text += '\n\n' + v
         ctx.u.listPendingBlank = false
       } else if (last.text.length === 0) {
@@ -230,7 +224,6 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       } else {
         last.text += '\n' + v
       }
-      if (emitHtml) block.html = renderHtml(block)
     },
 
     // A blank line inside a list flags pending-blank. If more list content
@@ -741,16 +734,9 @@ function renderHtml(block: any, refs: LinkRefMap = NO_REFS): string {
     }
     case 'list': {
       const tag = block.ordered ? 'ol' : 'ul'
+      const loose = !!block.loose
       const items = block.items
-        .map((it: any) => {
-          if (block.loose) {
-            const paragraphs = it.text.split(/\n\n+/).map((p: string) =>
-              `<p>${renderInline(p, refs)}</p>`,
-            )
-            return `<li>\n${paragraphs.join('\n')}\n</li>`
-          }
-          return `<li>${renderInline(it.text, refs)}</li>`
-        })
+        .map((it: any) => renderListItem(it.text, loose, refs))
         .join('\n')
       return `<${tag}>\n${items}\n</${tag}>`
     }
@@ -776,6 +762,37 @@ function renderHtml(block: any, refs: LinkRefMap = NO_REFS): string {
       return block.text
   }
   return ''
+}
+
+// renderListItem sub-parses the item's accumulated text and renders each
+// nested block. In tight lists a singleton paragraph is rendered without
+// its `<p>` wrapper (matching CommonMark), while other block types always
+// render in full.
+function renderListItem(
+  text: string,
+  loose: boolean,
+  refs: LinkRefMap,
+): string {
+  if (text.length === 0) return `<li></li>`
+  const nested = parseNested(text) as MdBlock[]
+  const ex = extractLinkRefsAndClean(nested)
+  const merged: LinkRefMap = { ...refs }
+  for (const k of Object.keys(ex.refs)) {
+    if (!(k in merged)) merged[k] = ex.refs[k]
+  }
+  const parts: string[] = []
+  for (const nb of ex.blocks) {
+    if (!loose && nb.type === 'paragraph') {
+      parts.push(renderInline((nb as any).text, merged))
+    } else {
+      parts.push(renderHtml(nb, merged))
+    }
+  }
+  if (parts.length === 0) return `<li></li>`
+  if (!loose && parts.length === 1 && !parts[0].startsWith('<')) {
+    return `<li>${parts[0]}</li>`
+  }
+  return `<li>\n${parts.join('\n')}\n</li>`
 }
 
 // parseNested runs the markdown parser on a substring for use inside a

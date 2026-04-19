@@ -212,11 +212,9 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				"ordered": v["ordered"],
 				"items":   []any{map[string]any{"text": v["text"]}},
 			}
-			if emitHTML {
-				block["html"] = RenderHTML(block)
-			}
 			pushBlock(r, block)
 			ensureMeta(ctx)["mdCurrent"] = block
+			// HTML deferred — list rendering sub-parses each item.
 		}),
 
 		"@list-append": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -228,9 +226,6 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			}
 			items, _ := cur["items"].([]any)
 			cur["items"] = append(items, map[string]any{"text": v["text"]})
-			if emitHTML {
-				cur["html"] = RenderHTML(cur)
-			}
 		}),
 
 		"@list-cont": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -247,9 +242,6 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				last["text"] = v
 			} else {
 				last["text"] = text + "\n" + v
-			}
-			if emitHTML {
-				cur["html"] = RenderHTML(cur)
 			}
 		}),
 
@@ -373,6 +365,46 @@ func ensureMeta(ctx *jsonic.Context) map[string]any {
 		ctx.Meta = make(map[string]any)
 	}
 	return ctx.Meta
+}
+
+// renderListItem sub-parses the item's accumulated text and renders each
+// nested block. In tight lists a singleton paragraph is rendered without
+// its `<p>` wrapper (matching CommonMark).
+func renderListItem(text string, loose bool, refs LinkRefMap) string {
+	if text == "" {
+		return "<li></li>"
+	}
+	nested := parseNested(text)
+	nestedRefs, cleaned := ExtractLinkRefsAndClean(nested)
+	merged := LinkRefMap{}
+	for k, v := range refs {
+		merged[k] = v
+	}
+	for k, v := range nestedRefs {
+		if _, ok := merged[k]; !ok {
+			merged[k] = v
+		}
+	}
+	var parts []string
+	for _, v := range cleaned {
+		nb, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if !loose && nb["type"] == "paragraph" {
+			txt, _ := nb["text"].(string)
+			parts = append(parts, renderInline(txt, merged))
+		} else {
+			parts = append(parts, renderBlockHTML(nb, merged))
+		}
+	}
+	if len(parts) == 0 {
+		return "<li></li>"
+	}
+	if !loose && len(parts) == 1 && (len(parts[0]) == 0 || parts[0][0] != '<') {
+		return "<li>" + parts[0] + "</li>"
+	}
+	return "<li>\n" + strings.Join(parts, "\n") + "\n</li>"
 }
 
 // parseNested runs the markdown parser on a substring for use inside a
@@ -934,23 +966,7 @@ func renderBlockHTML(block map[string]any, refs LinkRefMap) string {
 			}
 			m, _ := it.(map[string]any)
 			text, _ := m["text"].(string)
-			if loose {
-				b.WriteString("<li>\n")
-				paragraphs := splitParagraphs(text)
-				for j, p := range paragraphs {
-					if j > 0 {
-						b.WriteByte('\n')
-					}
-					b.WriteString("<p>")
-					b.WriteString(renderInline(p, refs))
-					b.WriteString("</p>")
-				}
-				b.WriteString("\n</li>")
-			} else {
-				b.WriteString("<li>")
-				b.WriteString(renderInline(text, refs))
-				b.WriteString("</li>")
-			}
+			b.WriteString(renderListItem(text, loose, refs))
 		}
 		b.WriteString("\n</")
 		b.WriteString(tag)
