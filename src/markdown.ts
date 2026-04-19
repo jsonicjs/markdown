@@ -1447,7 +1447,10 @@ function parseLinkRefDef(
     if (c === '\n') {
       label += c
       i++
-      if (label.split('\n').length > 2) return null
+      // A link label cannot contain a blank line (two line-endings
+      // separated only by whitespace). Multi-line labels are otherwise
+      // fine — the `[` ... `]` span can wrap over several lines.
+      if (/\n[ \t]*\n/.test(label)) return null
       continue
     }
     if (c === ']') {
@@ -1555,7 +1558,14 @@ function parseLinkRefDef(
       }
       if (c === '\n') {
         titleNewlines++
-        if (titleNewlines > 1) break
+        // A link title may span multiple lines but cannot contain a
+        // blank line. Detect by peeking at the next non-(space|tab)
+        // character — if it's another newline, this is a blank line.
+        let p = k + 1
+        while (p < text.length && (text[p] === ' ' || text[p] === '\t')) {
+          p++
+        }
+        if (p < text.length && text[p] === '\n') break
       }
       if (openQ === '(' && c === '(') break
       tbuf.push(c)

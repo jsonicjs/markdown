@@ -628,6 +628,7 @@ var (
 	reUnorderedBare     = regexp.MustCompile(`^( {0,3})[-*+][ \t]*$`)
 	reBlockquote        = regexp.MustCompile(`^ {0,3}>( ?)(.*)$`)
 	reOrderedFullStart1 = regexp.MustCompile(`^ {0,3}1[.)][ \t]`)
+	reLabelBlankLine    = regexp.MustCompile(`\n[ \t]*\n`)
 )
 
 // computeListItem determines the effective content column and first-line
@@ -1738,7 +1739,10 @@ func parseLinkRefDef(text string) (string, string, string, int, bool) {
 		if c == '\n' {
 			lb.WriteByte(c)
 			i++
-			if strings.Count(lb.String(), "\n") > 1 {
+			// A link label cannot contain a blank line (two line-endings
+			// separated only by whitespace). Multi-line labels are
+			// otherwise fine — `[` ... `]` may wrap over several lines.
+			if reLabelBlankLine.MatchString(lb.String()) {
 				return "", "", "", 0, false
 			}
 			continue
@@ -1857,7 +1861,6 @@ func parseLinkRefDef(text string) (string, string, string, int, bool) {
 		k := j + 1
 		var tb strings.Builder
 		ok := false
-		nls2 := 0
 		for k < len(text) {
 			c := text[k]
 			if c == '\\' && k+1 < len(text) {
@@ -1871,8 +1874,16 @@ func parseLinkRefDef(text string) (string, string, string, int, bool) {
 				break
 			}
 			if c == '\n' {
-				nls2++
-				if nls2 > 1 {
+				// A link title may span multiple lines but cannot
+				// contain a blank line. Peek past any trailing
+				// spaces/tabs on the next line — if the next non-
+				// whitespace character is another newline, the title
+				// would span a blank line, so terminate here.
+				p := k + 1
+				for p < len(text) && (text[p] == ' ' || text[p] == '\t') {
+					p++
+				}
+				if p < len(text) && text[p] == '\n' {
 					break
 				}
 			}
