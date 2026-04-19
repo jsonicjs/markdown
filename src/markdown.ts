@@ -275,14 +275,14 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       }
     },
 
-    // A blank line inside a list flags pending-blank and counts how many
-    // blanks have stacked up so a subsequent continuation preserves them
-    // verbatim in the item's accumulated text.
+    // A blank line inside a list counts the pending blanks so a
+    // subsequent item or continuation can use them.
     '@list-blank': (_r: Rule, ctx: Context) => {
       ctx.u.listPendingBlank = true
       ctx.u.listPendingBlanks =
         ((ctx.u.listPendingBlanks as number) || 0) + 1
     },
+
 
     '@quote-start': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
@@ -1125,6 +1125,10 @@ type InlineSeg =
       refLabel?: string
       refCollapsed?: boolean
       refShortcut?: boolean
+      // Original source text consumed for this segment (e.g. `[`, `![`,
+      // `]`, `](/url)`, `][label]`). Rendered verbatim when the segment
+      // ends up unmatched.
+      srcText: string
     }
 
 // Link reference definition — produced by extracting `[label]: url "title"`
@@ -1496,24 +1500,24 @@ function decodeLinkText(s: string): string {
 }
 
 // encodeLinkUrl performs CommonMark-style URL normalization: backslash
-// escapes and entities are decoded, existing percent-encoded sequences
-// are preserved (case-preserving), and any other character outside the
-// safe set is percent-encoded as its UTF-8 byte sequence.
-function encodeLinkUrl(url: string): string {
-  const decoded = decodeLinkText(url)
+// escapes and entities are decoded (unless decodeEscapes === false, as for
+// autolinks which are literal), existing percent-encoded sequences are
+// preserved (case-preserving), and any other character outside the safe
+// set is percent-encoded as its UTF-8 byte sequence.
+function encodeLinkUrl(url: string, decodeEscapes = true): string {
+  const src = decodeEscapes ? decodeLinkText(url) : url
   let out = ''
   let i = 0
-  while (i < decoded.length) {
-    const c = decoded[i]
+  while (i < src.length) {
+    const c = src[i]
     // Preserve a well-formed `%XX` percent-encoded byte.
     if (
       c === '%' &&
-      i + 2 < decoded.length &&
-      /[0-9a-fA-F]/.test(decoded[i + 1]) &&
-      /[0-9a-fA-F]/.test(decoded[i + 2])
+      i + 2 < src.length &&
+      /[0-9a-fA-F]/.test(src[i + 1]) &&
+      /[0-9a-fA-F]/.test(src[i + 2])
     ) {
-      out +=
-        '%' + decoded[i + 1].toUpperCase() + decoded[i + 2].toUpperCase()
+      out += '%' + src[i + 1].toUpperCase() + src[i + 2].toUpperCase()
       i += 3
       continue
     }
@@ -1667,7 +1671,8 @@ function tokenizeInline(s: string): InlineSeg[] {
     if (c === '<') {
       const rest = s.slice(i)
 
-      // Autolink URI: <scheme:path>
+      // Autolink URI: <scheme:path>. Autolink URL content is literal —
+      // no backslash-escape decoding.
       let m = rest.match(
         /^<([a-zA-Z][a-zA-Z0-9.+-]{1,31}:[^\s<>\x00-\x1f\x7f]*)>/,
       )
@@ -1676,7 +1681,7 @@ function tokenizeInline(s: string): InlineSeg[] {
           kind: 'html',
           value:
             '<a href="' +
-            encodeLinkUrl(m[1]) +
+            encodeLinkUrl(m[1], false) +
             '">' +
             escapeHtmlString(m[1]) +
             '</a>',
@@ -1694,7 +1699,7 @@ function tokenizeInline(s: string): InlineSeg[] {
           kind: 'html',
           value:
             '<a href="mailto:' +
-            encodeLinkUrl(m[1]) +
+            encodeLinkUrl(m[1], false) +
             '">' +
             escapeHtmlString(m[1]) +
             '</a>',
@@ -1754,6 +1759,7 @@ function tokenizeInline(s: string): InlineSeg[] {
         open: true,
         image: true,
         active: true,
+        srcText: '![',
       })
       i += 2
       continue
@@ -1766,6 +1772,7 @@ function tokenizeInline(s: string): InlineSeg[] {
         open: true,
         image: false,
         active: true,
+        srcText: '[',
       })
       i++
       continue
@@ -1784,6 +1791,7 @@ function tokenizeInline(s: string): InlineSeg[] {
           active: true,
           url: lt.url,
           title: lt.title,
+          srcText: s.slice(i, lt.end),
         })
         i = lt.end
         continue
@@ -1797,6 +1805,7 @@ function tokenizeInline(s: string): InlineSeg[] {
           active: true,
           refLabel: rl.collapsed ? undefined : rl.label,
           refCollapsed: rl.collapsed,
+          srcText: s.slice(i, rl.end),
         })
         i = rl.end
         continue
@@ -1807,6 +1816,7 @@ function tokenizeInline(s: string): InlineSeg[] {
         image: false,
         active: true,
         refShortcut: true,
+        srcText: ']',
       })
       i++
       continue
@@ -2052,10 +2062,8 @@ function renderSegments(segs: InlineSeg[]): string {
     } else if (seg.kind === 'delim') {
       out += escapeHtmlString(seg.char.repeat(seg.length))
     } else {
-      // bracket
-      out += escapeHtmlString(
-        seg.open ? (seg.image ? '![' : '[') : ']',
-      )
+      // bracket — render the original source verbatim (escaped).
+      out += escapeHtmlString(seg.srcText)
     }
   }
   return out

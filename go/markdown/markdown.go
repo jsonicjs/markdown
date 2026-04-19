@@ -1316,6 +1316,9 @@ type inlineSeg struct {
 	refCollapsed bool
 	refShortcut  bool
 	hasRef       bool
+	// Original source text consumed for this bracket segment; rendered
+	// verbatim when the segment ends up unmatched.
+	srcText string
 }
 
 // LinkRef is a link reference definition extracted from the block list.
@@ -1789,11 +1792,21 @@ func ExtractLinkRefsAndClean(blocks []any) (LinkRefMap, []any) {
 }
 
 // encodeLinkUrl performs CommonMark-style URL normalization: backslash
-// escapes and entities are decoded, existing percent-encoded sequences
-// are preserved (uppercased), and any other character outside the safe
-// set is percent-encoded as its UTF-8 byte sequence.
-func encodeLinkUrl(url string) string {
-	decoded := decodeLinkText(url)
+// escapes and entities are decoded (unless decodeEscapes is false, as for
+// autolinks which are literal), existing percent-encoded sequences are
+// preserved (uppercased), and any other character outside the safe set
+// is percent-encoded as its UTF-8 byte sequence.
+func encodeLinkUrl(url string, decodeEscapes ...bool) string {
+	decode := true
+	if len(decodeEscapes) > 0 {
+		decode = decodeEscapes[0]
+	}
+	var decoded string
+	if decode {
+		decoded = decodeLinkText(url)
+	} else {
+		decoded = url
+	}
 	var b strings.Builder
 	i := 0
 	for i < len(decoded) {
@@ -2007,7 +2020,7 @@ func tokenizeInline(s string) []*inlineSeg {
 				url := rest[m[2]:m[3]]
 				segs = append(segs, &inlineSeg{
 					kind:  segHTML,
-					value: `<a href="` + encodeLinkUrl(url) + `">` + escapeHTMLString(url) + `</a>`,
+					value: `<a href="` + encodeLinkUrl(url, false) + `">` + escapeHTMLString(url) + `</a>`,
 				})
 				i += m[1]
 				continue
@@ -2016,7 +2029,7 @@ func tokenizeInline(s string) []*inlineSeg {
 				email := rest[m[2]:m[3]]
 				segs = append(segs, &inlineSeg{
 					kind:  segHTML,
-					value: `<a href="mailto:` + encodeLinkUrl(email) + `">` + escapeHTMLString(email) + `</a>`,
+					value: `<a href="mailto:` + encodeLinkUrl(email, false) + `">` + escapeHTMLString(email) + `</a>`,
 				})
 				i += m[1]
 				continue
@@ -2057,10 +2070,11 @@ func tokenizeInline(s string) []*inlineSeg {
 		// Image open `![`.
 		if c == '!' && i+1 < n && s[i+1] == '[' {
 			segs = append(segs, &inlineSeg{
-				kind:   segBracket,
-				open:   true,
-				image:  true,
-				active: true,
+				kind:    segBracket,
+				open:    true,
+				image:   true,
+				active:  true,
+				srcText: "![",
 			})
 			i += 2
 			continue
@@ -2069,10 +2083,11 @@ func tokenizeInline(s string) []*inlineSeg {
 		// Link open `[`.
 		if c == '[' {
 			segs = append(segs, &inlineSeg{
-				kind:   segBracket,
-				open:   true,
-				image:  false,
-				active: true,
+				kind:    segBracket,
+				open:    true,
+				image:   false,
+				active:  true,
+				srcText: "[",
 			})
 			i++
 			continue
@@ -2083,12 +2098,13 @@ func tokenizeInline(s string) []*inlineSeg {
 		if c == ']' {
 			if url, title, end, ok := parseLinkTarget(s, i+1); ok {
 				segs = append(segs, &inlineSeg{
-					kind:   segBracket,
-					open:   false,
-					active: true,
-					url:    url,
-					title:  title,
-					hasURL: true,
+					kind:    segBracket,
+					open:    false,
+					active:  true,
+					url:     url,
+					title:   title,
+					hasURL:  true,
+					srcText: s[i:end],
 				})
 				i = end
 				continue
@@ -2100,6 +2116,7 @@ func tokenizeInline(s string) []*inlineSeg {
 					active:       true,
 					refCollapsed: collapsed,
 					hasRef:       true,
+					srcText:      s[i:end],
 				}
 				if !collapsed {
 					seg.refLabel = label
@@ -2114,6 +2131,7 @@ func tokenizeInline(s string) []*inlineSeg {
 				active:      true,
 				refShortcut: true,
 				hasRef:      true,
+				srcText:     "]",
 			})
 			i++
 			continue
@@ -2366,14 +2384,12 @@ func renderSegments(segs []*inlineSeg) string {
 		case segDelim:
 			b.WriteString(escapeHTMLString(strings.Repeat(string(s.char), s.length)))
 		case segBracket:
-			if s.open {
-				if s.image {
-					b.WriteString(escapeHTMLString("!["))
-				} else {
-					b.WriteString(escapeHTMLString("["))
-				}
+			// Render the original source verbatim (escaped) when
+			// unmatched.
+			if s.srcText != "" {
+				b.WriteString(escapeHTMLString(s.srcText))
 			} else {
-				b.WriteString(escapeHTMLString("]"))
+				// (Should not happen, but keep safe fallback.)
 			}
 		}
 	}
