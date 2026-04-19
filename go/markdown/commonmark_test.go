@@ -25,8 +25,8 @@ import (
 
 // minCommonMarkPasses is the regression floor. Bump upward as the parser
 // improves; never decrease without an explanation in the commit.
-// Current baseline: 573/652 (step 17: list item content indent).
-const minCommonMarkPasses = 567
+// Current baseline: 577/652 (step 18: emphasis unicode + list marker breaks).
+const minCommonMarkPasses = 572
 
 type commonMarkCase struct {
 	Markdown  string `json:"markdown"`

@@ -218,13 +218,34 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				}
 			}
 			pushBlock(r, block)
-			ensureMeta(ctx)["mdCurrent"] = block
-			// HTML deferred — list rendering sub-parses each item.
+			meta := ensureMeta(ctx)
+			meta["mdCurrent"] = block
+			meta["mdCurrentMarkerId"], _ = v["markerId"].(string)
 		}),
 
 		"@list-append": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(map[string]any)
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			prevMarker, _ := ctx.Meta["mdCurrentMarkerId"].(string)
+			newMarker, _ := v["markerId"].(string)
+			if newMarker != "" && newMarker != prevMarker {
+				// Different marker -> end current list, open a new one.
+				newBlock := map[string]any{
+					"type":    "list",
+					"ordered": v["ordered"],
+					"items":   []any{map[string]any{"text": v["text"]}},
+				}
+				if ord, _ := v["ordered"].(bool); ord {
+					if start, ok := v["start"].(int); ok && start != 1 {
+						newBlock["start"] = start
+					}
+				}
+				pushBlock(r, newBlock)
+				ctx.Meta["mdCurrent"] = newBlock
+				ctx.Meta["mdCurrentMarkerId"] = newMarker
+				ctx.Meta["listPendingBlank"] = false
+				return
+			}
 			if pending, _ := ctx.Meta["listPendingBlank"].(bool); pending {
 				cur["loose"] = true
 				ctx.Meta["listPendingBlank"] = false
@@ -473,8 +494,9 @@ var (
 	reOrderedFull   = regexp.MustCompile(`^( {0,3})(\d{1,9})([.)])([ \t]+)(.*)$`)
 	reUnorderedFull = regexp.MustCompile(`^( {0,3})([-*+])([ \t]+)(.*)$`)
 	reOrderedBare   = regexp.MustCompile(`^( {0,3})(\d{1,9})([.)])[ \t]*$`)
-	reUnorderedBare = regexp.MustCompile(`^( {0,3})[-*+][ \t]*$`)
-	reBlockquote    = regexp.MustCompile(`^ {0,3}>( ?)(.*)$`)
+	reUnorderedBare     = regexp.MustCompile(`^( {0,3})[-*+][ \t]*$`)
+	reBlockquote        = regexp.MustCompile(`^ {0,3}>( ?)(.*)$`)
+	reOrderedFullStart1 = regexp.MustCompile(`^ {0,3}1[.)][ \t]`)
 )
 
 // computeListItem determines the effective content column and first-line
@@ -808,8 +830,11 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				tkn = lex.Token("#MR", tinFor(lex, "#MR"), nil, srcPart)
 				kind = "hr"
 
-			// Ordered list item.
-			case reOrderedFull.MatchString(lineContent):
+			// Ordered list item. An ordered list can only interrupt a
+			// paragraph with start == 1.
+			case reOrderedFull.MatchString(lineContent) &&
+				(state.last != "text" ||
+					reOrderedFullStart1.MatchString(lineContent)):
 				m := reOrderedFull.FindStringSubmatch(lineContent)
 				markerEnd := len(m[1]) + len(m[2]) + 1
 				cc, text := computeListItem(markerEnd, len(m[4]), m[5])
@@ -817,9 +842,10 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				start := 0
 				fmt.Sscanf(m[2], "%d", &start)
 				val := map[string]any{
-					"ordered": true,
-					"text":    text,
-					"start":   start,
+					"ordered":  true,
+					"text":     text,
+					"start":    start,
+					"markerId": "o" + m[3],
 				}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
@@ -831,7 +857,11 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				markerEnd := len(m[1]) + len(m[2])
 				cc, text := computeListItem(markerEnd, len(m[3]), m[4])
 				state.listContentCol = cc
-				val := map[string]any{"ordered": false, "text": text}
+				val := map[string]any{
+					"ordered":  false,
+					"text":     text,
+					"markerId": "u" + m[2],
+				}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
@@ -841,7 +871,11 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			case state.last != "text" && reUnorderedBare.MatchString(lineContent):
 				m := reUnorderedBare.FindStringSubmatch(lineContent)
 				state.listContentCol = len(m[1]) + 2
-				val := map[string]any{"ordered": false, "text": ""}
+				val := map[string]any{
+					"ordered":  false,
+					"text":     "",
+					"markerId": "u" + string(lineContent[len(m[1])]),
+				}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
@@ -852,9 +886,10 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				start := 0
 				fmt.Sscanf(m[2], "%d", &start)
 				val := map[string]any{
-					"ordered": true,
-					"text":    "",
-					"start":   start,
+					"ordered":  true,
+					"text":     "",
+					"start":    start,
+					"markerId": "o" + m[3],
 				}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)

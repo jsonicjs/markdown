@@ -193,24 +193,57 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
         ordered: boolean
         text: string
         start?: number
+        markerId?: string
       }
       const block: any = {
         type: 'list',
         ordered: v.ordered,
         items: [{ text: v.text }],
       }
+      // Store the marker identity as a non-enumerable property so it's
+      // used internally for list-break detection but invisible to the
+      // block-structure equality checks exposed to consumers.
+      Object.defineProperty(block, '_markerId', {
+        value: v.markerId,
+        enumerable: false,
+        writable: true,
+      })
       if (v.ordered && v.start !== undefined && v.start !== 1) {
         block.start = v.start
       }
       r.node.push(block)
       ctx.u.mdCurrent = block
-      // HTML deferred — list rendering sub-parses each item and must
-      // not re-enter during the outer parse.
     },
 
     '@list-append': (r: Rule, ctx: Context) => {
-      const v = r.o0.val as { ordered: boolean; text: string }
+      const v = r.o0.val as {
+        ordered: boolean
+        text: string
+        start?: number
+        markerId?: string
+      }
       const block = ctx.u.mdCurrent
+      // A marker-character change ends the current list and opens a new
+      // sibling list in the result array rather than appending.
+      if (v.markerId !== undefined && v.markerId !== block._markerId) {
+        const newBlock: any = {
+          type: 'list',
+          ordered: v.ordered,
+          items: [{ text: v.text }],
+        }
+        Object.defineProperty(newBlock, '_markerId', {
+          value: v.markerId,
+          enumerable: false,
+          writable: true,
+        })
+        if (v.ordered && v.start !== undefined && v.start !== 1) {
+          newBlock.start = v.start
+        }
+        r.node.push(newBlock)
+        ctx.u.mdCurrent = newBlock
+        ctx.u.listPendingBlank = false
+        return
+      }
       if (ctx.u.listPendingBlank) {
         block.loose = true
         ctx.u.listPendingBlank = false
@@ -420,8 +453,13 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       // context-sensitive classification (indented code vs. paragraph
       // continuation, setext underline recognition, list continuation).
       const lexAny = lex as any
-      const state: { last: string; listContentCol: number } =
-        lexAny.__md ?? (lexAny.__md = { last: 'start', listContentCol: 0 })
+      const state: {
+        last: string
+        listContentCol: number
+        listMarkerId?: string
+      } =
+        lexAny.__md ??
+        (lexAny.__md = { last: 'start', listContentCol: 0 })
 
       // Read the current line (exclusive of trailing \n).
       let lineEnd = sI
@@ -617,8 +655,14 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         kind = 'hr'
       }
 
-      // Ordered list item. CommonMark limits the marker to 1-9 digits.
-      else if (/^ {0,3}\d{1,9}[.)][ \t]/.test(lineContent)) {
+      // Ordered list item. CommonMark limits the marker to 1-9 digits, and
+      // an ordered list can only interrupt a paragraph when its first
+      // item has start == 1.
+      else if (
+        /^ {0,3}\d{1,9}[.)][ \t]/.test(lineContent) &&
+        (state.last !== 'text' ||
+          /^ {0,3}1[.)][ \t]/.test(lineContent))
+      ) {
         const m = lineContent.match(/^( {0,3})(\d{1,9})([.)])([ \t]+)(.*)$/)!
         const result = computeListItem(
           m[1].length + m[2].length + 1,
@@ -627,10 +671,11 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         )
         state.listContentCol = result.contentCol
         const start = parseInt(m[2], 10)
+        const markerId = 'o' + m[3]
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token(
           '#ML',
-          { ordered: true, text: result.text, start },
+          { ordered: true, text: result.text, start, markerId },
           srcPart,
           pnt,
         )
@@ -646,10 +691,11 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
           m[4],
         )
         state.listContentCol = result.contentCol
+        const markerId = 'u' + m[2]
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token(
           '#ML',
-          { ordered: false, text: result.text },
+          { ordered: false, text: result.text, markerId },
           srcPart,
           pnt,
         )
@@ -665,8 +711,14 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       ) {
         const m = lineContent.match(/^( {0,3})([-*+])/)!
         state.listContentCol = m[1].length + m[2].length + 1
+        const markerId = 'u' + m[2]
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#ML', { ordered: false, text: '' }, srcPart, pnt)
+        tkn = lex.token(
+          '#ML',
+          { ordered: false, text: '', markerId },
+          srcPart,
+          pnt,
+        )
         kind = 'list'
       }
 
@@ -677,10 +729,11 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         const m = lineContent.match(/^( {0,3})(\d{1,9})([.)])/)!
         state.listContentCol = m[1].length + m[2].length + 1 + 1
         const start = parseInt(m[2], 10)
+        const markerId = 'o' + m[3]
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token(
           '#ML',
-          { ordered: true, text: '', start },
+          { ordered: true, text: '', start, markerId },
           srcPart,
           pnt,
         )
@@ -751,6 +804,7 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         kind !== 'blank'
       ) {
         state.listContentCol = 0
+        state.listMarkerId = undefined
       }
 
       // Advance the lex point past the consumed span, tracking row/column.
@@ -1021,9 +1075,11 @@ type LinkRefMap = Record<string, LinkRef>
 
 const NO_REFS: LinkRefMap = {}
 
-// ASCII punctuation used for CommonMark flanking classification. The full
-// spec uses Unicode punctuation; this is a close ASCII approximation.
-const ASCII_PUNCT = /[!-/:-@\[-`{-~]/
+// Punctuation set for CommonMark emphasis flanking classification. Matches
+// ASCII punctuation plus any Unicode character in the P (punctuation) or S
+// (symbol) general category — the latter covers currency symbols, math
+// operators, etc., which CommonMark treats like punctuation for flanking.
+const ASCII_PUNCT = /[!-/:-@\[-`{-~]|\p{P}|\p{S}/u
 
 function isWhitespaceChar(c: string): boolean {
   return c === '' || c === ' ' || c === '\t' || c === '\n' || c === '\r'
