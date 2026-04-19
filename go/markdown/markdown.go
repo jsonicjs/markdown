@@ -74,8 +74,17 @@ const grammarText = `
   ]
 
   rule: list-tail: open: [
-    { s: '#ML' a: '@list-append' r: list-tail g: 'md,list,more' }
+    { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,more' }
+    { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,cont' }
+    { s: '#MB'  a: '@list-blank'  r: list-tail-blank g: 'md,list,blank' }
     { g: 'md,list,end' }
+  ]
+
+  rule: list-tail-blank: open: [
+    { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,blank,item' }
+    { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,blank,cont' }
+    { s: '#MB'  r: list-tail-blank g: 'md,list,blank,more' }
+    { g: 'md,list,blank,end' }
   ]
 
   rule: quote-tail: open: [
@@ -142,6 +151,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 	j.Token("#MSX")
 	j.Token("#MIC")
 	j.Token("#MHB")
+	j.Token("#MLC")
 
 	// Named function references for declarative grammar definition.
 	refs := map[jsonic.FuncRef]any{
@@ -211,11 +221,39 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 		"@list-append": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(map[string]any)
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			if pending, _ := ctx.Meta["listPendingBlank"].(bool); pending {
+				cur["loose"] = true
+				ctx.Meta["listPendingBlank"] = false
+			}
 			items, _ := cur["items"].([]any)
 			cur["items"] = append(items, map[string]any{"text": v["text"]})
 			if emitHTML {
 				cur["html"] = RenderHTML(cur)
 			}
+		}),
+
+		"@list-cont": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			v, _ := r.O0.Val.(string)
+			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			items, _ := cur["items"].([]any)
+			last, _ := items[len(items)-1].(map[string]any)
+			text, _ := last["text"].(string)
+			if pending, _ := ctx.Meta["listPendingBlank"].(bool); pending {
+				cur["loose"] = true
+				last["text"] = text + "\n\n" + v
+				ctx.Meta["listPendingBlank"] = false
+			} else if text == "" {
+				last["text"] = v
+			} else {
+				last["text"] = text + "\n" + v
+			}
+			if emitHTML {
+				cur["html"] = RenderHTML(cur)
+			}
+		}),
+
+		"@list-blank": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			ensureMeta(ctx)["listPendingBlank"] = true
 		}),
 
 		"@quote-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -339,14 +377,46 @@ func ensureMeta(ctx *jsonic.Context) map[string]any {
 	return ctx.Meta
 }
 
+// splitParagraphs splits a loose-list item's accumulated text on runs of
+// two or more newlines. Empty trailing chunks are dropped.
+func splitParagraphs(s string) []string {
+	out := []string{}
+	chunk := strings.Builder{}
+	blanks := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			blanks++
+			if blanks == 1 {
+				continue
+			}
+			if chunk.Len() > 0 {
+				out = append(out, chunk.String())
+				chunk.Reset()
+			}
+			continue
+		}
+		if blanks == 1 && chunk.Len() > 0 {
+			chunk.WriteByte('\n')
+		}
+		blanks = 0
+		chunk.WriteByte(s[i])
+	}
+	if chunk.Len() > 0 {
+		out = append(out, chunk.String())
+	}
+	return out
+}
+
 // Pre-compiled line classification regexes.
 var (
-	reBlank      = regexp.MustCompile(`^[ \t]*$`)
-	reATX        = regexp.MustCompile(`^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$`)
-	reSetext     = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
-	reOrdered    = regexp.MustCompile(`^\s*(\d+)[.)]\s+(.*)$`)
-	reUnordered  = regexp.MustCompile(`^\s*[-*+]\s+(.*)$`)
-	reBlockquote = regexp.MustCompile(`^\s*>\s?(.*)$`)
+	reBlank         = regexp.MustCompile(`^[ \t]*$`)
+	reATX           = regexp.MustCompile(`^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$`)
+	reSetext        = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
+	reOrderedFull   = regexp.MustCompile(`^( {0,3})(\d+[.)])([ \t]+)(.*)$`)
+	reUnorderedFull = regexp.MustCompile(`^( {0,3})([-*+])([ \t]+)(.*)$`)
+	reOrderedBare   = regexp.MustCompile(`^( {0,3})(\d+[.)])[ \t]*$`)
+	reUnorderedBare = regexp.MustCompile(`^( {0,3})[-*+][ \t]*$`)
+	reBlockquote    = regexp.MustCompile(`^\s*>\s?(.*)$`)
 )
 
 // stripIndent removes up to 3 leading spaces from a line. CommonMark allows
@@ -450,7 +520,8 @@ func isHorizontalRule(s string) bool {
 // recognition). A fresh map is keyed by *jsonic.Lex pointer so state
 // resets on each new parse.
 type lexState struct {
-	last string // last emitted token kind
+	last           string // last emitted token kind
+	listContentCol int    // content column of current list item, 0 if none
 }
 
 var lexStates = map[*jsonic.Lex]*lexState{}
@@ -663,20 +734,48 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				kind = "hr"
 
 			// Ordered list item.
-			case reOrdered.MatchString(lineContent):
-				m := reOrdered.FindStringSubmatch(lineContent)
-				val := map[string]any{"ordered": true, "text": m[2]}
+			case reOrderedFull.MatchString(lineContent):
+				m := reOrderedFull.FindStringSubmatch(lineContent)
+				state.listContentCol = len(m[1]) + len(m[2]) + len(m[3])
+				val := map[string]any{"ordered": true, "text": m[4]}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
 
 			// Unordered list item.
-			case reUnordered.MatchString(lineContent):
-				m := reUnordered.FindStringSubmatch(lineContent)
-				val := map[string]any{"ordered": false, "text": m[1]}
+			case reUnorderedFull.MatchString(lineContent):
+				m := reUnorderedFull.FindStringSubmatch(lineContent)
+				state.listContentCol = len(m[1]) + len(m[2]) + len(m[3])
+				val := map[string]any{"ordered": false, "text": m[4]}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
+
+			// Bare list marker with no content on the same line.
+			case reUnorderedBare.MatchString(lineContent):
+				m := reUnorderedBare.FindStringSubmatch(lineContent)
+				state.listContentCol = len(m[1]) + 2
+				val := map[string]any{"ordered": false, "text": ""}
+				srcPart := src[sI:consumeEnd]
+				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
+				kind = "list"
+
+			case reOrderedBare.MatchString(lineContent):
+				m := reOrderedBare.FindStringSubmatch(lineContent)
+				state.listContentCol = len(m[1]) + len(m[2]) + 1
+				val := map[string]any{"ordered": true, "text": ""}
+				srcPart := src[sI:consumeEnd]
+				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
+				kind = "list"
+
+			// Indented continuation of the current list item.
+			case state.listContentCol > 0 &&
+				len(lineContent) >= state.listContentCol &&
+				strings.TrimLeft(lineContent[:state.listContentCol], " ") == "":
+				stripped := lineContent[state.listContentCol:]
+				srcPart := src[sI:consumeEnd]
+				tkn = lex.Token("#MLC", tinFor(lex, "#MLC"), stripped, srcPart)
+				kind = "listcont"
 
 			// Blockquote line.
 			case reBlockquote.MatchString(lineContent):
@@ -704,14 +803,25 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 					kind = "icode"
 				}
 
-			// Plain text line.
+			// Plain text line. Up to 3 leading spaces are allowed slack;
+			// strip them so paragraph content starts flush.
 			default:
+				stripped := lineContent
+				lead := 0
+				for lead < 3 && lead < len(stripped) && stripped[lead] == ' ' {
+					lead++
+				}
+				stripped = stripped[lead:]
 				srcPart := src[sI:consumeEnd]
-				tkn = lex.Token("#MT", tinFor(lex, "#MT"), lineContent, srcPart)
+				tkn = lex.Token("#MT", tinFor(lex, "#MT"), stripped, srcPart)
 				kind = "text"
 			}
 
 			state.last = kind
+			// Reset list continuation tracking when we leave list context.
+			if kind != "list" && kind != "listcont" && kind != "blank" {
+				state.listContentCol = 0
+			}
 
 			// Advance the lex cursor past the consumed span, tracking row/column.
 			for i := sI; i < consumeEnd; i++ {
@@ -791,6 +901,7 @@ func renderBlockHTML(block map[string]any, refs LinkRefMap) string {
 		if ordered, _ := block["ordered"].(bool); ordered {
 			tag = "ol"
 		}
+		loose, _ := block["loose"].(bool)
 		items, _ := block["items"].([]any)
 		var b strings.Builder
 		b.WriteString("<")
@@ -802,9 +913,23 @@ func renderBlockHTML(block map[string]any, refs LinkRefMap) string {
 			}
 			m, _ := it.(map[string]any)
 			text, _ := m["text"].(string)
-			b.WriteString("<li>")
-			b.WriteString(renderInline(text, refs))
-			b.WriteString("</li>")
+			if loose {
+				b.WriteString("<li>\n")
+				paragraphs := splitParagraphs(text)
+				for j, p := range paragraphs {
+					if j > 0 {
+						b.WriteByte('\n')
+					}
+					b.WriteString("<p>")
+					b.WriteString(renderInline(p, refs))
+					b.WriteString("</p>")
+				}
+				b.WriteString("\n</li>")
+			} else {
+				b.WriteString("<li>")
+				b.WriteString(renderInline(text, refs))
+				b.WriteString("</li>")
+			}
 		}
 		b.WriteString("\n</")
 		b.WriteString(tag)

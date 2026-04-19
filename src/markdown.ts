@@ -27,6 +27,7 @@ type MdBlock =
       type: 'list'
       ordered: boolean
       items: { text: string }[]
+      loose?: boolean
       html?: string
     }
   | { type: 'blockquote'; text: string; html?: string }
@@ -92,8 +93,17 @@ const grammarText = `
   ]
 
   rule: list-tail: open: [
-    { s: '#ML' a: '@list-append' r: list-tail g: 'md,list,more' }
+    { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,more' }
+    { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,cont' }
+    { s: '#MB'  a: '@list-blank'  r: list-tail-blank g: 'md,list,blank' }
     { g: 'md,list,end' }
+  ]
+
+  rule: list-tail-blank: open: [
+    { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,blank,item' }
+    { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,blank,cont' }
+    { s: '#MB'  r: list-tail-blank g: 'md,list,blank,more' }
+    { g: 'md,list,blank,end' }
   ]
 
   rule: quote-tail: open: [
@@ -190,8 +200,43 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
 
     '@list-append': (r: Rule, ctx: Context) => {
       const v = r.o0.val as { ordered: boolean; text: string }
-      ctx.u.mdCurrent.items.push({ text: v.text })
-      if (emitHtml) ctx.u.mdCurrent.html = renderHtml(ctx.u.mdCurrent)
+      const block = ctx.u.mdCurrent
+      // Only blanks that are followed by more list content (item or
+      // continuation) actually upgrade the list to loose. This check
+      // happens here because we now know the blank didn't terminate
+      // the list.
+      if (ctx.u.listPendingBlank) {
+        block.loose = true
+        ctx.u.listPendingBlank = false
+      }
+      block.items.push({ text: v.text })
+      if (emitHtml) block.html = renderHtml(block)
+    },
+
+    '@list-cont': (r: Rule, ctx: Context) => {
+      const v = r.o0.val as string
+      const block = ctx.u.mdCurrent
+      const items = block.items
+      const last = items[items.length - 1]
+      if (ctx.u.listPendingBlank) {
+        block.loose = true
+        // Preserve a paragraph break in the raw item text so the renderer
+        // can split loose items into their constituent paragraphs.
+        last.text += '\n\n' + v
+        ctx.u.listPendingBlank = false
+      } else if (last.text.length === 0) {
+        last.text = v
+      } else {
+        last.text += '\n' + v
+      }
+      if (emitHtml) block.html = renderHtml(block)
+    },
+
+    // A blank line inside a list flags pending-blank. If more list content
+    // follows, @list-append / @list-cont will promote the list to loose;
+    // otherwise the flag is simply discarded when the list ends.
+    '@list-blank': (_r: Rule, ctx: Context) => {
+      ctx.u.listPendingBlank = true
     },
 
     '@quote-start': (r: Rule, ctx: Context) => {
@@ -343,10 +388,10 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       // Per-parse state is attached to the lex instance so it resets on
       // each new parse. mdLast tracks the last emitted token kind for
       // context-sensitive classification (indented code vs. paragraph
-      // continuation, setext underline recognition, etc.).
+      // continuation, setext underline recognition, list continuation).
       const lexAny = lex as any
-      const state: { last: string } =
-        lexAny.__md ?? (lexAny.__md = { last: 'start' })
+      const state: { last: string; listContentCol: number } =
+        lexAny.__md ?? (lexAny.__md = { last: 'start', listContentCol: 0 })
 
       // Read the current line (exclusive of trailing \n).
       let lineEnd = sI
@@ -546,19 +591,55 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       }
 
       // Ordered list item.
-      else if (/^\s*(\d+)[.)]\s+/.test(lineContent)) {
-        const m = lineContent.match(/^\s*(\d+)[.)]\s+(.*)$/)!
+      else if (/^ {0,3}\d+[.)][ \t]/.test(lineContent)) {
+        const m = lineContent.match(/^( {0,3})(\d+[.)])([ \t]+)(.*)$/)!
+        const contentCol = m[1].length + m[2].length + m[3].length
+        state.listContentCol = contentCol
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#ML', { ordered: true, text: m[2] }, srcPart, pnt)
+        tkn = lex.token('#ML', { ordered: true, text: m[4] }, srcPart, pnt)
         kind = 'list'
       }
 
       // Unordered list item.
-      else if (/^\s*[-*+]\s+/.test(lineContent)) {
-        const m = lineContent.match(/^\s*[-*+]\s+(.*)$/)!
+      else if (/^ {0,3}[-*+][ \t]/.test(lineContent)) {
+        const m = lineContent.match(/^( {0,3})([-*+])([ \t]+)(.*)$/)!
+        const contentCol = m[1].length + m[2].length + m[3].length
+        state.listContentCol = contentCol
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#ML', { ordered: false, text: m[1] }, srcPart, pnt)
+        tkn = lex.token('#ML', { ordered: false, text: m[4] }, srcPart, pnt)
         kind = 'list'
+      }
+
+      // Bare list marker with no content on the same line.
+      else if (/^ {0,3}[-*+][ \t]*$/.test(lineContent)) {
+        const m = lineContent.match(/^( {0,3})([-*+])/)!
+        state.listContentCol = m[1].length + m[2].length + 1
+        srcPart = src.substring(sI, consumeEnd)
+        tkn = lex.token('#ML', { ordered: false, text: '' }, srcPart, pnt)
+        kind = 'list'
+      }
+
+      else if (/^ {0,3}\d+[.)][ \t]*$/.test(lineContent)) {
+        const m = lineContent.match(/^( {0,3})(\d+[.)])/)!
+        state.listContentCol = m[1].length + m[2].length + 1
+        srcPart = src.substring(sI, consumeEnd)
+        tkn = lex.token('#ML', { ordered: true, text: '' }, srcPart, pnt)
+        kind = 'list'
+      }
+
+      // Indented continuation of the current list item. Must come after
+      // the list-marker checks so a new item starts a new list entry
+      // rather than silently appending to the previous one.
+      else if (
+        state.listContentCol > 0 &&
+        lineContent.length >= state.listContentCol &&
+        /^ +/.test(lineContent.slice(0, state.listContentCol)) &&
+        lineContent.slice(0, state.listContentCol).trim() === ''
+      ) {
+        const stripped = lineContent.slice(state.listContentCol)
+        srcPart = src.substring(sI, consumeEnd)
+        tkn = lex.token('#MLC', stripped, srcPart, pnt)
+        kind = 'listcont'
       }
 
       // Blockquote line.
@@ -587,14 +668,26 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         }
       }
 
-      // Plain text line.
+      // Plain text line. Up to 3 leading spaces are spec-allowed slack;
+      // strip them so paragraph content starts flush.
       else {
+        const stripped = lineContent.replace(/^ {0,3}/, '')
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#MT', lineContent, srcPart, pnt)
+        tkn = lex.token('#MT', stripped, srcPart, pnt)
         kind = 'text'
       }
 
       state.last = kind
+      // When we leave list context (non-list, non-continuation, non-blank
+      // following a list) reset the saved content column. Blank lines
+      // preserve it so item continuation can resume after them.
+      if (
+        kind !== 'list' &&
+        kind !== 'listcont' &&
+        kind !== 'blank'
+      ) {
+        state.listContentCol = 0
+      }
 
       // Advance the lex point past the consumed span, tracking row/column.
       for (let i = sI; i < consumeEnd; i++) {
@@ -645,7 +738,15 @@ function renderHtml(block: any, refs: LinkRefMap = NO_REFS): string {
     case 'list': {
       const tag = block.ordered ? 'ol' : 'ul'
       const items = block.items
-        .map((it: any) => `<li>${renderInline(it.text, refs)}</li>`)
+        .map((it: any) => {
+          if (block.loose) {
+            const paragraphs = it.text.split(/\n\n+/).map((p: string) =>
+              `<p>${renderInline(p, refs)}</p>`,
+            )
+            return `<li>\n${paragraphs.join('\n')}\n</li>`
+          }
+          return `<li>${renderInline(it.text, refs)}</li>`
+        })
         .join('\n')
       return `<${tag}>\n${items}\n</${tag}>`
     }
