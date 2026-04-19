@@ -275,6 +275,33 @@ function stripIndent(s: string): string {
   return s.slice(i)
 }
 
+// expandLeadingTabs replaces tabs in the line's leading whitespace with
+// spaces that advance to the next tab stop at multiples of 4. Non-leading
+// tabs are preserved, matching CommonMark's rule that tabs behave as
+// spaces for the purposes of block-structure classification but keep
+// their literal value inside code content.
+function expandLeadingTabs(s: string): string {
+  let out = ''
+  let col = 0
+  let i = 0
+  while (i < s.length) {
+    const c = s[i]
+    if (c === ' ') {
+      out += ' '
+      col++
+      i++
+    } else if (c === '\t') {
+      const spaces = 4 - (col % 4)
+      out += ' '.repeat(spaces)
+      col += spaces
+      i++
+    } else {
+      break
+    }
+  }
+  return out + s.slice(i)
+}
+
 // HTML block recognition tables (CommonMark § 4.6). We implement types 1-5
 // (distinct end markers) and type 7 (any well-formed tag on a line by
 // itself, terminated by a blank line). Type 6 (the long list of
@@ -332,6 +359,9 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       if (lineContent.endsWith('\r')) {
         lineContent = lineContent.slice(0, -1)
       }
+      // Expand leading tabs so block-structure classification sees
+      // effective column positions.
+      lineContent = expandLeadingTabs(lineContent)
 
       let tkn
       let srcPart: string

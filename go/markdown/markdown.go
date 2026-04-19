@@ -360,6 +360,34 @@ func stripIndent(s string) string {
 	return s[i:]
 }
 
+// expandLeadingTabs replaces tabs in the line's leading whitespace with
+// spaces that advance to the next tab stop at multiples of 4. Non-leading
+// tabs are preserved.
+func expandLeadingTabs(s string) string {
+	var b strings.Builder
+	col := 0
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == ' ' {
+			b.WriteByte(' ')
+			col++
+			i++
+		} else if c == '\t' {
+			spaces := 4 - (col % 4)
+			for k := 0; k < spaces; k++ {
+				b.WriteByte(' ')
+			}
+			col += spaces
+			i++
+		} else {
+			break
+		}
+	}
+	b.WriteString(s[i:])
+	return b.String()
+}
+
 // HTML block recognition (CommonMark § 4.6). Types 1-5 have distinct end
 // markers; type 7 is any well-formed open or close tag on a line by
 // itself, terminated by a blank line.
@@ -467,6 +495,7 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			if strings.HasSuffix(lineContent, "\r") {
 				lineContent = lineContent[:len(lineContent)-1]
 			}
+			lineContent = expandLeadingTabs(lineContent)
 
 			var tkn *jsonic.Token
 			kind := "text"
