@@ -108,6 +108,7 @@ const grammarText = `
 
   rule: quote-tail: open: [
     { s: '#MQ' a: '@quote-append' r: quote-tail g: 'md,quote,more' }
+    { s: '#MT' a: '@quote-append' r: quote-tail g: 'md,quote,lazy' }
     { g: 'md,quote,end' }
   ]
 
@@ -242,15 +243,16 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     '@quote-start': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
       const block: any = { type: 'blockquote', text: v }
-      if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
       ctx.u.mdCurrent = block
+      // HTML is deferred until toHtml runs so that the nested parse the
+      // blockquote renderer performs cannot re-enter during the outer
+      // parse and disrupt grammar state.
     },
 
     '@quote-append': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
       ctx.u.mdCurrent.text += '\n' + v
-      if (emitHtml) ctx.u.mdCurrent.html = renderHtml(ctx.u.mdCurrent)
     },
 
     '@para-start': (r: Rule, ctx: Context) => {
@@ -642,11 +644,13 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         kind = 'listcont'
       }
 
-      // Blockquote line.
-      else if (/^\s*>\s?/.test(lineContent)) {
-        const m = lineContent.match(/^\s*>\s?(.*)$/)!
+      // Blockquote line. CommonMark allows up to 3 leading spaces before
+      // the `>`, and optionally one space after it (which is not included
+      // in the content).
+      else if (/^ {0,3}>/.test(lineContent)) {
+        const m = lineContent.match(/^ {0,3}>( ?)(.*)$/)!
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#MQ', m[1], srcPart, pnt)
+        tkn = lex.token('#MQ', m[2], srcPart, pnt)
         kind = 'quote'
       }
 
@@ -750,16 +754,42 @@ function renderHtml(block: any, refs: LinkRefMap = NO_REFS): string {
         .join('\n')
       return `<${tag}>\n${items}\n</${tag}>`
     }
-    case 'blockquote':
-      return (
-        `<blockquote>\n<p>` +
-        renderInline(block.text, refs) +
-        `</p>\n</blockquote>`
-      )
+    case 'blockquote': {
+      // Re-parse the blockquote's raw content as markdown so nested
+      // headings, lists, code blocks, and further blockquotes render
+      // correctly. Refs defined inside a blockquote are merged with the
+      // outer refs for resolution within the nested blocks.
+      const nestedBlocks = parseNested(block.text) as MdBlock[]
+      const nestedExtract = extractLinkRefsAndClean(nestedBlocks)
+      const merged: LinkRefMap = { ...refs }
+      for (const k of Object.keys(nestedExtract.refs)) {
+        if (!(k in merged)) merged[k] = nestedExtract.refs[k]
+      }
+      let inner = ''
+      for (const nb of nestedExtract.blocks) {
+        const h = renderHtml(nb, merged)
+        if (h.length > 0) inner += h + '\n'
+      }
+      return `<blockquote>\n${inner}</blockquote>`
+    }
     case 'html':
       return block.text
   }
   return ''
+}
+
+// parseNested runs the markdown parser on a substring for use inside a
+// blockquote or other nested block. The parser instance is cached so
+// repeated nested parses don't rebuild the grammar on each call.
+let _nestedParser: ((src: string) => any) | null = null
+function parseNested(src: string): MdBlock[] {
+  if (_nestedParser === null) {
+    const j = Jsonic.make()
+    j.use(Markdown)
+    _nestedParser = j
+  }
+  const result = _nestedParser(src)
+  return Array.isArray(result) ? (result as MdBlock[]) : []
 }
 
 // escapeHtml performs minimal HTML escaping: `& < > "`. Used for code content

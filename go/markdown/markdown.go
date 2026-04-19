@@ -89,6 +89,7 @@ const grammarText = `
 
   rule: quote-tail: open: [
     { s: '#MQ' a: '@quote-append' r: quote-tail g: 'md,quote,more' }
+    { s: '#MT' a: '@quote-append' r: quote-tail g: 'md,quote,lazy' }
     { g: 'md,quote,end' }
   ]
 
@@ -259,11 +260,11 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 		"@quote-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(string)
 			block := map[string]any{"type": "blockquote", "text": v}
-			if emitHTML {
-				block["html"] = RenderHTML(block)
-			}
 			pushBlock(r, block)
 			ensureMeta(ctx)["mdCurrent"] = block
+			// HTML for blockquotes is deferred to ToHTML so the nested
+			// parse the blockquote renderer performs cannot re-enter
+			// during the outer parse and disrupt grammar state.
 		}),
 
 		"@quote-append": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -271,9 +272,6 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
 			text, _ := cur["text"].(string)
 			cur["text"] = text + "\n" + v
-			if emitHTML {
-				cur["html"] = RenderHTML(cur)
-			}
 		}),
 
 		"@para-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -377,6 +375,29 @@ func ensureMeta(ctx *jsonic.Context) map[string]any {
 	return ctx.Meta
 }
 
+// parseNested runs the markdown parser on a substring for use inside a
+// blockquote or other nested block. The parser instance is cached so
+// repeated nested parses don't rebuild the grammar on each call.
+var nestedParser *jsonic.Jsonic
+
+func parseNested(src string) []any {
+	if nestedParser == nil {
+		j := jsonic.Make()
+		if err := j.UseDefaults(Markdown, Defaults); err != nil {
+			return nil
+		}
+		nestedParser = j
+	}
+	result, err := nestedParser.Parse(src)
+	if err != nil {
+		return nil
+	}
+	if arr, ok := result.([]any); ok {
+		return arr
+	}
+	return nil
+}
+
 // splitParagraphs splits a loose-list item's accumulated text on runs of
 // two or more newlines. Empty trailing chunks are dropped.
 func splitParagraphs(s string) []string {
@@ -416,7 +437,7 @@ var (
 	reUnorderedFull = regexp.MustCompile(`^( {0,3})([-*+])([ \t]+)(.*)$`)
 	reOrderedBare   = regexp.MustCompile(`^( {0,3})(\d+[.)])[ \t]*$`)
 	reUnorderedBare = regexp.MustCompile(`^( {0,3})[-*+][ \t]*$`)
-	reBlockquote    = regexp.MustCompile(`^\s*>\s?(.*)$`)
+	reBlockquote    = regexp.MustCompile(`^ {0,3}>( ?)(.*)$`)
 )
 
 // stripIndent removes up to 3 leading spaces from a line. CommonMark allows
@@ -781,7 +802,7 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			case reBlockquote.MatchString(lineContent):
 				m := reBlockquote.FindStringSubmatch(lineContent)
 				srcPart := src[sI:consumeEnd]
-				tkn = lex.Token("#MQ", tinFor(lex, "#MQ"), m[1], srcPart)
+				tkn = lex.Token("#MQ", tinFor(lex, "#MQ"), m[2], srcPart)
 				kind = "quote"
 
 			// Indented line (4+ spaces or tab): code block unless it
@@ -938,7 +959,35 @@ func renderBlockHTML(block map[string]any, refs LinkRefMap) string {
 
 	case "blockquote":
 		text, _ := block["text"].(string)
-		return "<blockquote>\n<p>" + renderInline(text, refs) + "</p>\n</blockquote>"
+		// Re-parse the blockquote's content as markdown so nested
+		// headings, lists, code blocks, and further blockquotes render
+		// correctly. Refs defined inside merge with the outer refs.
+		nestedBlocks := parseNested(text)
+		nestedRefs, cleaned := ExtractLinkRefsAndClean(nestedBlocks)
+		merged := LinkRefMap{}
+		for k, v := range refs {
+			merged[k] = v
+		}
+		for k, v := range nestedRefs {
+			if _, ok := merged[k]; !ok {
+				merged[k] = v
+			}
+		}
+		var b strings.Builder
+		b.WriteString("<blockquote>\n")
+		for _, nb := range cleaned {
+			m, ok := nb.(map[string]any)
+			if !ok {
+				continue
+			}
+			h := renderBlockHTML(m, merged)
+			if h != "" {
+				b.WriteString(h)
+				b.WriteByte('\n')
+			}
+		}
+		b.WriteString("</blockquote>")
+		return b.String()
 
 	case "html":
 		text, _ := block["text"].(string)
