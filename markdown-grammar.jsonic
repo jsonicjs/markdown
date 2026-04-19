@@ -36,17 +36,20 @@
   ]
 
   rule: block: open: [
-    { s: '#MB' g: 'md,blank' }
-    { s: '#MH' a: '@heading'    g: 'md,heading' }
-    { s: '#MR' a: '@hr'         g: 'md,hr' }
-    { s: '#MC' a: '@code'       g: 'md,code' }
-    { s: '#ML' a: '@list-start' p: list-tail  g: 'md,list' }
-    { s: '#MQ' a: '@quote-start' p: quote-tail g: 'md,quote' }
-    { s: '#MT' a: '@para-start' p: para-tail  g: 'md,para' }
+    { s: '#MB'  g: 'md,blank' }
+    { s: '#MH'  a: '@heading'    g: 'md,heading' }
+    { s: '#MR'  a: '@hr'         g: 'md,hr' }
+    { s: '#MC'  a: '@code'       g: 'md,code' }
+    { s: '#MIC' a: '@icode-start' p: icode-tail g: 'md,icode' }
+    { s: '#ML'  a: '@list-start'  p: list-tail  g: 'md,list' }
+    { s: '#MQ'  a: '@quote-start' p: quote-tail g: 'md,quote' }
+    { s: '#MT'  a: '@para-start'  p: para-tail  g: 'md,para' }
+    { s: '#MSX' g: 'md,setext,stray' }
   ]
 
   rule: para-tail: open: [
-    { s: '#MT' a: '@para-append' r: para-tail g: 'md,para,more' }
+    { s: '#MSX' a: '@setext-promote' g: 'md,setext,close' }
+    { s: '#MT'  a: '@para-append' r: para-tail g: 'md,para,more' }
     { g: 'md,para,end' }
   ]
 
@@ -58,5 +61,10 @@
   rule: quote-tail: open: [
     { s: '#MQ' a: '@quote-append' r: quote-tail g: 'md,quote,more' }
     { g: 'md,quote,end' }
+  ]
+
+  rule: icode-tail: open: [
+    { s: '#MIC' a: '@icode-append' r: icode-tail g: 'md,icode,more' }
+    { g: 'md,icode,end' }
   ]
 }

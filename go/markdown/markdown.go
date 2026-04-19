@@ -55,17 +55,20 @@ const grammarText = `
   ]
 
   rule: block: open: [
-    { s: '#MB' g: 'md,blank' }
-    { s: '#MH' a: '@heading'    g: 'md,heading' }
-    { s: '#MR' a: '@hr'         g: 'md,hr' }
-    { s: '#MC' a: '@code'       g: 'md,code' }
-    { s: '#ML' a: '@list-start' p: list-tail  g: 'md,list' }
-    { s: '#MQ' a: '@quote-start' p: quote-tail g: 'md,quote' }
-    { s: '#MT' a: '@para-start' p: para-tail  g: 'md,para' }
+    { s: '#MB'  g: 'md,blank' }
+    { s: '#MH'  a: '@heading'    g: 'md,heading' }
+    { s: '#MR'  a: '@hr'         g: 'md,hr' }
+    { s: '#MC'  a: '@code'       g: 'md,code' }
+    { s: '#MIC' a: '@icode-start' p: icode-tail g: 'md,icode' }
+    { s: '#ML'  a: '@list-start'  p: list-tail  g: 'md,list' }
+    { s: '#MQ'  a: '@quote-start' p: quote-tail g: 'md,quote' }
+    { s: '#MT'  a: '@para-start'  p: para-tail  g: 'md,para' }
+    { s: '#MSX' g: 'md,setext,stray' }
   ]
 
   rule: para-tail: open: [
-    { s: '#MT' a: '@para-append' r: para-tail g: 'md,para,more' }
+    { s: '#MSX' a: '@setext-promote' g: 'md,setext,close' }
+    { s: '#MT'  a: '@para-append' r: para-tail g: 'md,para,more' }
     { g: 'md,para,end' }
   ]
 
@@ -77,6 +80,11 @@ const grammarText = `
   rule: quote-tail: open: [
     { s: '#MQ' a: '@quote-append' r: quote-tail g: 'md,quote,more' }
     { g: 'md,quote,end' }
+  ]
+
+  rule: icode-tail: open: [
+    { s: '#MIC' a: '@icode-append' r: icode-tail g: 'md,icode,more' }
+    { g: 'md,icode,end' }
   ]
 }
 `
@@ -130,6 +138,8 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 	j.Token("#MQ")
 	j.Token("#MT")
 	j.Token("#MB")
+	j.Token("#MSX")
+	j.Token("#MIC")
 
 	// Named function references for declarative grammar definition.
 	refs := map[jsonic.FuncRef]any{
@@ -242,6 +252,41 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				cur["html"] = RenderHTML(cur)
 			}
 		}),
+
+		// Setext underline encountered while accumulating a paragraph:
+		// rewrite the current block in place as a heading.
+		"@setext-promote": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			v, _ := r.O0.Val.(map[string]any)
+			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			cur["type"] = "heading"
+			cur["level"] = v["level"]
+			if text, ok := cur["text"].(string); ok {
+				cur["text"] = strings.TrimSpace(text)
+			}
+			if emitHTML {
+				cur["html"] = RenderHTML(cur)
+			}
+		}),
+
+		"@icode-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			v, _ := r.O0.Val.(string)
+			block := map[string]any{"type": "code", "lang": "", "text": v}
+			if emitHTML {
+				block["html"] = RenderHTML(block)
+			}
+			pushBlock(r, block)
+			ensureMeta(ctx)["mdCurrent"] = block
+		}),
+
+		"@icode-append": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			v, _ := r.O0.Val.(string)
+			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			text, _ := cur["text"].(string)
+			cur["text"] = text + "\n" + v
+			if emitHTML {
+				cur["html"] = RenderHTML(cur)
+			}
+		}),
 	}
 
 	// Parse embedded grammar definition using a separate standard Jsonic instance,
@@ -285,13 +330,24 @@ func ensureMeta(ctx *jsonic.Context) map[string]any {
 
 // Pre-compiled line classification regexes.
 var (
-	reBlank      = regexp.MustCompile(`^\s*$`)
-	reHeading    = regexp.MustCompile(`^(#{1,6})\s+(.*)$`)
+	reBlank      = regexp.MustCompile(`^[ \t]*$`)
+	reATX        = regexp.MustCompile(`^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$`)
+	reSetext     = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
 	reOrdered    = regexp.MustCompile(`^\s*(\d+)[.)]\s+(.*)$`)
 	reUnordered  = regexp.MustCompile(`^\s*[-*+]\s+(.*)$`)
 	reBlockquote = regexp.MustCompile(`^\s*>\s?(.*)$`)
-	reTrailHash  = regexp.MustCompile(`\s+#+\s*$`)
 )
+
+// stripIndent removes up to 3 leading spaces from a line. CommonMark allows
+// that much indentation on most block-level constructs before they count as
+// indented code.
+func stripIndent(s string) string {
+	i := 0
+	for i < 3 && i < len(s) && s[i] == ' ' {
+		i++
+	}
+	return s[i:]
+}
 
 // isHorizontalRule reports whether s is a markdown horizontal rule line:
 // at most 3 leading spaces/tabs, then 3+ of the same `-`, `*`, or `_`
@@ -323,6 +379,16 @@ func isHorizontalRule(s string) bool {
 	return count >= 3
 }
 
+// lexState is the per-parse per-lexer state used for context-sensitive
+// classification (indented code vs. paragraph continuation, setext
+// recognition). A fresh map is keyed by *jsonic.Lex pointer so state
+// resets on each new parse.
+type lexState struct {
+	last string // last emitted token kind
+}
+
+var lexStates = map[*jsonic.Lex]*lexState{}
+
 // buildMarkdownLineMatcher returns a custom lexer matcher that emits one
 // token per markdown line. Fenced code blocks are consumed in full and
 // emitted as a single #MC token.
@@ -338,7 +404,15 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 
 			// No input left: let jsonic emit #ZZ.
 			if sI >= srclen {
+				delete(lexStates, lex)
 				return nil
+			}
+
+			// Per-parse state keyed on the lex instance.
+			state, ok := lexStates[lex]
+			if !ok {
+				state = &lexState{last: "start"}
+				lexStates[lex] = state
 			}
 
 			// Read the current line (exclusive of trailing \n).
@@ -357,16 +431,19 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			}
 
 			var tkn *jsonic.Token
+			kind := "text"
 
 			switch {
 			// Blank line.
 			case reBlank.MatchString(lineContent):
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#MB", tinFor(lex, "#MB"), nil, srcPart)
+				kind = "blank"
 
 			// Fenced code block.
-			case strings.HasPrefix(lineContent, fence):
-				lang := strings.TrimSpace(lineContent[len(fence):])
+			case strings.HasPrefix(stripIndent(lineContent), fence):
+				stripped := stripIndent(lineContent)
+				lang := strings.TrimSpace(stripped[len(fence):])
 				codeLines := []string{}
 				codeEnd := consumeEnd
 
@@ -383,7 +460,7 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 					if innerEnd < srclen {
 						nextEnd = innerEnd + 1
 					}
-					if strings.HasPrefix(innerLine, fence) {
+					if strings.HasPrefix(stripIndent(innerLine), fence) {
 						codeEnd = nextEnd
 						break
 					}
@@ -396,19 +473,35 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				srcPart := src[sI:consumeEnd]
 				val := map[string]any{"lang": lang, "text": codeText}
 				tkn = lex.Token("#MC", tinFor(lex, "#MC"), val, srcPart)
+				kind = "code"
 
-			// Heading.
-			case reHeading.MatchString(lineContent):
-				m := reHeading.FindStringSubmatch(lineContent)
-				text := strings.TrimSpace(reTrailHash.ReplaceAllString(m[2], ""))
+			// ATX heading: 0-3 leading spaces, 1-6 `#`, optional space+text,
+			// optional trailing `#` sequence preceded by whitespace.
+			case reATX.MatchString(lineContent):
+				m := reATX.FindStringSubmatch(lineContent)
+				text := strings.TrimSpace(m[2])
 				val := map[string]any{"level": len(m[1]), "text": text}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#MH", tinFor(lex, "#MH"), val, srcPart)
+				kind = "heading"
+
+			// Setext underline: only valid immediately after a paragraph line.
+			case state.last == "text" && reSetext.MatchString(lineContent):
+				trimmed := strings.TrimLeft(lineContent, " \t")
+				level := 2
+				if len(trimmed) > 0 && trimmed[0] == '=' {
+					level = 1
+				}
+				val := map[string]any{"level": level}
+				srcPart := src[sI:consumeEnd]
+				tkn = lex.Token("#MSX", tinFor(lex, "#MSX"), val, srcPart)
+				kind = "setext"
 
 			// Horizontal rule.
 			case isHorizontalRule(lineContent):
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#MR", tinFor(lex, "#MR"), nil, srcPart)
+				kind = "hr"
 
 			// Ordered list item.
 			case reOrdered.MatchString(lineContent):
@@ -416,6 +509,7 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				val := map[string]any{"ordered": true, "text": m[2]}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
+				kind = "list"
 
 			// Unordered list item.
 			case reUnordered.MatchString(lineContent):
@@ -423,18 +517,42 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				val := map[string]any{"ordered": false, "text": m[1]}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
+				kind = "list"
 
 			// Blockquote line.
 			case reBlockquote.MatchString(lineContent):
 				m := reBlockquote.FindStringSubmatch(lineContent)
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#MQ", tinFor(lex, "#MQ"), m[1], srcPart)
+				kind = "quote"
+
+			// Indented line (4+ spaces or tab): code block unless it
+			// continues a paragraph.
+			case strings.HasPrefix(lineContent, "    ") || strings.HasPrefix(lineContent, "\t"):
+				if state.last == "text" {
+					srcPart := src[sI:consumeEnd]
+					tkn = lex.Token("#MT", tinFor(lex, "#MT"), lineContent, srcPart)
+					kind = "text"
+				} else {
+					var stripped string
+					if strings.HasPrefix(lineContent, "\t") {
+						stripped = lineContent[1:]
+					} else {
+						stripped = lineContent[4:]
+					}
+					srcPart := src[sI:consumeEnd]
+					tkn = lex.Token("#MIC", tinFor(lex, "#MIC"), stripped, srcPart)
+					kind = "icode"
+				}
 
 			// Plain text line.
 			default:
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#MT", tinFor(lex, "#MT"), lineContent, srcPart)
+				kind = "text"
 			}
+
+			state.last = kind
 
 			// Advance the lex cursor past the consumed span, tracking row/column.
 			for i := sI; i < consumeEnd; i++ {

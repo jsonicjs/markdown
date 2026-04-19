@@ -72,17 +72,20 @@ const grammarText = `
   ]
 
   rule: block: open: [
-    { s: '#MB' g: 'md,blank' }
-    { s: '#MH' a: '@heading'    g: 'md,heading' }
-    { s: '#MR' a: '@hr'         g: 'md,hr' }
-    { s: '#MC' a: '@code'       g: 'md,code' }
-    { s: '#ML' a: '@list-start' p: list-tail  g: 'md,list' }
-    { s: '#MQ' a: '@quote-start' p: quote-tail g: 'md,quote' }
-    { s: '#MT' a: '@para-start' p: para-tail  g: 'md,para' }
+    { s: '#MB'  g: 'md,blank' }
+    { s: '#MH'  a: '@heading'    g: 'md,heading' }
+    { s: '#MR'  a: '@hr'         g: 'md,hr' }
+    { s: '#MC'  a: '@code'       g: 'md,code' }
+    { s: '#MIC' a: '@icode-start' p: icode-tail g: 'md,icode' }
+    { s: '#ML'  a: '@list-start'  p: list-tail  g: 'md,list' }
+    { s: '#MQ'  a: '@quote-start' p: quote-tail g: 'md,quote' }
+    { s: '#MT'  a: '@para-start'  p: para-tail  g: 'md,para' }
+    { s: '#MSX' g: 'md,setext,stray' }
   ]
 
   rule: para-tail: open: [
-    { s: '#MT' a: '@para-append' r: para-tail g: 'md,para,more' }
+    { s: '#MSX' a: '@setext-promote' g: 'md,setext,close' }
+    { s: '#MT'  a: '@para-append' r: para-tail g: 'md,para,more' }
     { g: 'md,para,end' }
   ]
 
@@ -94,6 +97,11 @@ const grammarText = `
   rule: quote-tail: open: [
     { s: '#MQ' a: '@quote-append' r: quote-tail g: 'md,quote,more' }
     { g: 'md,quote,end' }
+  ]
+
+  rule: icode-tail: open: [
+    { s: '#MIC' a: '@icode-append' r: icode-tail g: 'md,icode,more' }
+    { g: 'md,icode,end' }
   ]
 }
 `
@@ -207,6 +215,37 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       ctx.u.mdCurrent.text += '\n' + (options.trim ? v.trim() : v)
       if (emitHtml) ctx.u.mdCurrent.html = renderHtml(ctx.u.mdCurrent)
     },
+
+    // Setext underline encountered while accumulating a paragraph: rewrite
+    // the current block in place as a heading. The grammar drops out of
+    // para-tail after this action, so the underline token is consumed.
+    '@setext-promote': (_r: Rule, ctx: Context) => {
+      const { level } = r_o0_val(_r) as { level: number }
+      const block = ctx.u.mdCurrent
+      block.type = 'heading'
+      block.level = level
+      block.text = block.text.trim()
+      if (emitHtml) block.html = renderHtml(block)
+    },
+
+    '@icode-start': (r: Rule, ctx: Context) => {
+      const v = r.o0.val as string
+      const block: any = { type: 'code', lang: '', text: v }
+      if (emitHtml) block.html = renderHtml(block)
+      r.node.push(block)
+      ctx.u.mdCurrent = block
+    },
+
+    '@icode-append': (r: Rule, ctx: Context) => {
+      const v = r.o0.val as string
+      ctx.u.mdCurrent.text += '\n' + v
+      if (emitHtml) ctx.u.mdCurrent.html = renderHtml(ctx.u.mdCurrent)
+    },
+  }
+
+  // Helper used by @setext-promote so the body reads naturally.
+  function r_o0_val(r: Rule): any {
+    return r.o0.val
   }
 
 
@@ -217,6 +256,15 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
   jsonic.grammar(grammarDef)
 }
 
+
+// stripIndent removes up to 3 leading spaces from a line. CommonMark allows
+// that much indentation on most block-level constructs before they count as
+// indented code.
+function stripIndent(s: string): string {
+  let i = 0
+  while (i < 3 && i < s.length && s[i] === ' ') i++
+  return s.slice(i)
+}
 
 // Build the line-level lexer matcher. It scans one markdown line at a time
 // (including the trailing newline) and emits a token classified by block kind.
@@ -236,6 +284,14 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       // No input left: let Jsonic emit #ZZ.
       if (sI >= srclen) return undefined
 
+      // Per-parse state is attached to the lex instance so it resets on
+      // each new parse. mdLast tracks the last emitted token kind for
+      // context-sensitive classification (indented code vs. paragraph
+      // continuation, setext underline recognition, etc.).
+      const lexAny = lex as any
+      const state: { last: string } =
+        lexAny.__md ?? (lexAny.__md = { last: 'start' })
+
       // Read the current line (exclusive of trailing \n).
       let lineEnd = sI
       while (lineEnd < srclen && src[lineEnd] !== '\n') lineEnd++
@@ -250,18 +306,21 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
 
       let tkn
       let srcPart: string
+      let kind = 'text'
 
       // Classify the line.
 
       // Blank line.
-      if (/^\s*$/.test(lineContent)) {
+      if (/^[ \t]*$/.test(lineContent)) {
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token('#MB', null, srcPart, pnt)
+        kind = 'blank'
       }
 
       // Fenced code block start.
-      else if (lineContent.startsWith(fence)) {
-        const lang = lineContent.substring(fence.length).trim()
+      else if (stripIndent(lineContent).startsWith(fence)) {
+        const stripped = stripIndent(lineContent)
+        const lang = stripped.substring(fence.length).trim()
         const codeLines: string[] = []
         let codeEnd = consumeEnd
         let closed = false
@@ -274,7 +333,7 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
 
           const nextEnd = innerEnd < srclen ? innerEnd + 1 : innerEnd
 
-          if (innerLine.startsWith(fence)) {
+          if (stripIndent(innerLine).startsWith(fence)) {
             codeEnd = nextEnd
             closed = true
             break
@@ -291,48 +350,64 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         consumeEnd = codeEnd
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token('#MC', { lang, text: codeText }, srcPart, pnt)
+        kind = 'code'
       }
 
-      // Heading: 1-6 leading # followed by a space.
-      else if (/^#{1,6}\s+/.test(lineContent)) {
-        const m = lineContent.match(/^(#{1,6})\s+(.*)$/)!
+      // ATX heading: up to 3 leading spaces, 1-6 `#`, then space+text or end
+      // of line. Trailing `#` sequences preceded by whitespace are stripped.
+      else if (
+        /^ {0,3}(#{1,6})(?:[ \t]+.*?)?(?:[ \t]+#+)?[ \t]*$/.test(lineContent)
+      ) {
+        const m = lineContent.match(
+          /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/,
+        )!
+        const textRaw = (m[2] ?? '').trim()
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token(
           '#MH',
-          { level: m[1].length, text: m[2].replace(/\s+#+\s*$/, '').trim() },
+          { level: m[1].length, text: textRaw },
           srcPart,
           pnt,
         )
+        kind = 'heading'
+      }
+
+      // Setext underline: only valid immediately after a paragraph line.
+      // When recognized, it closes the current paragraph as a heading.
+      else if (
+        state.last === 'text' &&
+        /^ {0,3}(=+|-+)[ \t]*$/.test(lineContent)
+      ) {
+        const level = lineContent.trimStart()[0] === '=' ? 1 : 2
+        srcPart = src.substring(sI, consumeEnd)
+        tkn = lex.token('#MSX', { level }, srcPart, pnt)
+        kind = 'setext'
       }
 
       // Horizontal rule: line of 3+ `-`, `*`, or `_`, optionally spaced.
-      else if (/^[ \t]{0,3}([-*_])[ \t]*\1[ \t]*\1([ \t]*\1)*[ \t]*$/.test(lineContent)) {
+      // (Setext underline takes precedence above when a paragraph precedes.)
+      else if (
+        /^[ \t]{0,3}([-*_])[ \t]*\1[ \t]*\1([ \t]*\1)*[ \t]*$/.test(lineContent)
+      ) {
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token('#MR', null, srcPart, pnt)
+        kind = 'hr'
       }
 
       // Ordered list item.
       else if (/^\s*(\d+)[.)]\s+/.test(lineContent)) {
         const m = lineContent.match(/^\s*(\d+)[.)]\s+(.*)$/)!
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token(
-          '#ML',
-          { ordered: true, text: m[2] },
-          srcPart,
-          pnt,
-        )
+        tkn = lex.token('#ML', { ordered: true, text: m[2] }, srcPart, pnt)
+        kind = 'list'
       }
 
       // Unordered list item.
       else if (/^\s*[-*+]\s+/.test(lineContent)) {
         const m = lineContent.match(/^\s*[-*+]\s+(.*)$/)!
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token(
-          '#ML',
-          { ordered: false, text: m[1] },
-          srcPart,
-          pnt,
-        )
+        tkn = lex.token('#ML', { ordered: false, text: m[1] }, srcPart, pnt)
+        kind = 'list'
       }
 
       // Blockquote line.
@@ -340,13 +415,35 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         const m = lineContent.match(/^\s*>\s?(.*)$/)!
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token('#MQ', m[1], srcPart, pnt)
+        kind = 'quote'
+      }
+
+      // Indented line (4+ spaces or leading tab): indented code block,
+      // unless we're currently inside a paragraph (in which case it's
+      // paragraph continuation).
+      else if (/^(?:    |\t)/.test(lineContent)) {
+        if (state.last === 'text') {
+          srcPart = src.substring(sI, consumeEnd)
+          tkn = lex.token('#MT', lineContent, srcPart, pnt)
+          kind = 'text'
+        } else {
+          const stripped = lineContent.startsWith('\t')
+            ? lineContent.slice(1)
+            : lineContent.slice(4)
+          srcPart = src.substring(sI, consumeEnd)
+          tkn = lex.token('#MIC', stripped, srcPart, pnt)
+          kind = 'icode'
+        }
       }
 
       // Plain text line.
       else {
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token('#MT', lineContent, srcPart, pnt)
+        kind = 'text'
       }
+
+      state.last = kind
 
       // Advance the lex point past the consumed span, tracking row/column.
       for (let i = sI; i < consumeEnd; i++) {

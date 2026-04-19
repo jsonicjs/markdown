@@ -25,8 +25,8 @@ import (
 
 // minCommonMarkPasses is the regression floor. Bump upward as the parser
 // improves; never decrease without an explanation in the commit.
-// Baseline: 143/652 on block-level features.
-const minCommonMarkPasses = 140
+// Current baseline: 178/652 (step 1: setext + indented code + ATX fixes).
+const minCommonMarkPasses = 175
 
 type commonMarkCase struct {
 	Markdown  string `json:"markdown"`
