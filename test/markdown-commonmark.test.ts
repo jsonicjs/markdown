@@ -43,8 +43,8 @@ const spec: SpecCase[] = JSON.parse(readFileSync(specPath, 'utf8'))
 
 // Minimum expected pass count — acts as a regression floor. Bump upward as
 // the parser improves. Never decrease without an explanation in the commit.
-// Current baseline: 651/652 (step 45: partial-tab in container markers).
-const MIN_PASSES = 648
+// Current baseline: 652/652 (step 46: preserve listContentCol across lazy text).
+const MIN_PASSES = 650
 
 describe('commonmark-spec', () => {
   test('conformance-summary', () => {

@@ -1302,8 +1302,11 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			}
 
 			state.last = kind
-			// Reset list continuation tracking when we leave list context.
-			if kind != "list" && kind != "listcont" && kind != "blank" {
+			// Reset list continuation tracking when we leave list
+			// context. Blank lines preserve the saved column and so do
+			// bare `text` lines (potential lazy continuation of the
+			// list item's paragraph — spec example 290).
+			if kind != "list" && kind != "listcont" && kind != "blank" && kind != "text" {
 				state.listContentCol = 0
 				state.listItemEmpty = false
 			}

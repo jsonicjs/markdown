@@ -1084,11 +1084,14 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       state.last = kind
       // When we leave list context (non-list, non-continuation, non-blank
       // following a list) reset the saved content column. Blank lines
-      // preserve it so item continuation can resume after them.
+      // preserve it so item continuation can resume after them, and a
+      // bare paragraph-like `text` line can still be a lazy continuation
+      // of the list item (spec example 290), so preserve across those too.
       if (
         kind !== 'list' &&
         kind !== 'listcont' &&
-        kind !== 'blank'
+        kind !== 'blank' &&
+        kind !== 'text'
       ) {
         state.listContentCol = 0
         state.listMarkerId = undefined
