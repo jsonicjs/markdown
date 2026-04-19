@@ -68,7 +68,8 @@ const grammarText = `
   ]
 
   rule: para-tail: open: [
-    { s: '#MSX' a: '@setext-promote' g: 'md,setext,close' }
+    { s: '#MSX' c: '@setext-has-content' a: '@setext-promote' g: 'md,setext,close' }
+    { s: '#MSX' a: '@setext-as-para' r: para-tail g: 'md,setext,stray' }
     { s: '#MT'  a: '@para-append' r: para-tail g: 'md,para,more' }
     { g: 'md,para,end' }
   ]
@@ -387,6 +388,25 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			}
 		}),
 
+		// Guard: the current paragraph has promotable content (something
+		// beyond leading link-reference definitions). Only when this
+		// holds does the setext underline actually produce a heading.
+		"@setext-has-content": jsonic.AltCond(func(r *jsonic.Rule, ctx *jsonic.Context) bool {
+			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			if cur == nil {
+				return false
+			}
+			text, _ := cur["text"].(string)
+			for {
+				_, _, _, length, ok := parseLinkRefDef(text)
+				if !ok {
+					break
+				}
+				text = text[length:]
+			}
+			return strings.TrimSpace(text) != ""
+		}),
+
 		// Setext underline encountered while accumulating a paragraph:
 		// rewrite the current block in place as a heading.
 		"@setext-promote": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -412,12 +432,32 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				cur["_implicitRefDefs"] = defs
 			}
 			text = strings.TrimSpace(text)
-			if text == "" {
-				return
-			}
 			cur["type"] = "heading"
 			cur["level"] = v["level"]
 			cur["text"] = text
+		}),
+
+		// Setext underline encountered when the paragraph is entirely
+		// link reference definitions — the underline cannot promote to
+		// a heading (nothing to promote), so fold the underline's raw
+		// text onto the paragraph as its next line and keep going.
+		"@setext-as-para": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			v, _ := r.O0.Val.(map[string]any)
+			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
+			raw, _ := v["raw"].(string)
+			line := raw
+			if trim {
+				line = strings.TrimSpace(line)
+			}
+			text, _ := cur["text"].(string)
+			if text == "" {
+				cur["text"] = line
+			} else {
+				cur["text"] = text + "\n" + line
+			}
+			if emitHTML {
+				cur["html"] = RenderHTML(cur)
+			}
 		}),
 
 		"@icode-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -994,7 +1034,7 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				if len(trimmed) > 0 && trimmed[0] == '=' {
 					level = 1
 				}
-				val := map[string]any{"level": level}
+				val := map[string]any{"level": level, "raw": lineContent}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#MSX", tinFor(lex, "#MSX"), val, srcPart)
 				kind = "setext"

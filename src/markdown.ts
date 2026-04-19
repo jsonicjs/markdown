@@ -88,7 +88,8 @@ const grammarText = `
   ]
 
   rule: para-tail: open: [
-    { s: '#MSX' a: '@setext-promote' g: 'md,setext,close' }
+    { s: '#MSX' c: '@setext-has-content' a: '@setext-promote' g: 'md,setext,close' }
+    { s: '#MSX' a: '@setext-as-para' r: para-tail g: 'md,setext,stray' }
     { s: '#MT'  a: '@para-append' r: para-tail g: 'md,para,more' }
     { g: 'md,para,end' }
   ]
@@ -364,6 +365,20 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       if (emitHtml) ctx.u.mdCurrent.html = renderHtml(ctx.u.mdCurrent)
     },
 
+    // Guard: the current paragraph has promotable content (something
+    // beyond leading link-reference definitions). Only when this holds
+    // does the setext underline actually produce a heading.
+    '@setext-has-content': (_r: Rule, ctx: Context) => {
+      const block = ctx.u.mdCurrent
+      let text = block?.text ?? ''
+      while (true) {
+        const def = parseLinkRefDef(text)
+        if (!def) break
+        text = text.slice(def.length)
+      }
+      return text.trim().length > 0
+    },
+
     // Setext underline encountered while accumulating a paragraph: rewrite
     // the current block in place as a heading. The grammar drops out of
     // para-tail after this action, so the underline token is consumed.
@@ -390,16 +405,21 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
         })
       }
       text = text.trim()
-      if (text.length === 0) {
-        // No heading content — paragraph promoted nothing. Leave block
-        // as a paragraph containing whatever original text was there.
-        // The enclosing paragraph will drop out later during ref
-        // extraction (its text is purely ref-def content).
-        return
-      }
       block.type = 'heading'
       block.level = level
       block.text = text
+    },
+
+    // Setext underline encountered when the paragraph is entirely link
+    // reference definitions — the underline cannot promote to a heading
+    // (nothing to promote), so fold the underline's raw text onto the
+    // paragraph as its next line and keep accumulating paragraph content.
+    '@setext-as-para': (r: Rule, ctx: Context) => {
+      const v = r.o0.val as { level: number; raw: string }
+      const block = ctx.u.mdCurrent
+      const line = options.trim ? v.raw.trim() : v.raw
+      block.text = block.text.length === 0 ? line : block.text + '\n' + line
+      if (emitHtml) block.html = renderHtml(block)
     },
 
     '@icode-start': (r: Rule, ctx: Context) => {
@@ -791,7 +811,12 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       ) {
         const level = lineContent.trimStart()[0] === '=' ? 1 : 2
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#MSX', { level }, srcPart, pnt)
+        tkn = lex.token(
+          '#MSX',
+          { level, raw: lineContent },
+          srcPart,
+          pnt,
+        )
         kind = 'setext'
       }
 

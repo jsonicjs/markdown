@@ -49,7 +49,8 @@
   ]
 
   rule: para-tail: open: [
-    { s: '#MSX' a: '@setext-promote' g: 'md,setext,close' }
+    { s: '#MSX' c: '@setext-has-content' a: '@setext-promote' g: 'md,setext,close' }
+    { s: '#MSX' a: '@setext-as-para' r: para-tail g: 'md,setext,stray' }
     { s: '#MT'  a: '@para-append' r: para-tail g: 'md,para,more' }
     { g: 'md,para,end' }
   ]
