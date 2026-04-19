@@ -1290,16 +1290,95 @@ function extractLinkRefsAndClean(
   return { refs, blocks: out }
 }
 
-// encodeLinkUrl applies a minimal URL normalization to the destination URL:
-// only `&`, `<`, `>`, `"`, and ` ` are replaced, matching the subset of
-// CommonMark's full percent-encoding that most spec tests exercise.
+// The "unreserved + reserved-safe" set preserved by CommonMark's URL
+// normalization. Characters outside this set are percent-encoded as UTF-8.
+const URL_SAFE = /[A-Za-z0-9\-._~!$&'()*+,;=:@/?#]/
+
+// decodeLinkText decodes backslash escapes and well-formed entity
+// references in link/title text. Invalid sequences are passed through.
+function decodeLinkText(s: string): string {
+  let out = ''
+  let i = 0
+  const n = s.length
+  while (i < n) {
+    const c = s[i]
+    if (c === '\\' && i + 1 < n && BACKSLASH_ESCAPABLE.indexOf(s[i + 1]) >= 0) {
+      out += s[i + 1]
+      i += 2
+      continue
+    }
+    if (c === '&') {
+      const m = s
+        .slice(i)
+        .match(
+          /^&(#[xX][0-9a-fA-F]{1,6};|#[0-9]{1,7};|[a-zA-Z][a-zA-Z0-9]{1,31};)/,
+        )
+      if (m) {
+        const decoded = decodeEntity('&' + m[1])
+        if (decoded !== null) {
+          out += decoded
+          i += m[0].length
+          continue
+        }
+      }
+    }
+    out += c
+    i++
+  }
+  return out
+}
+
+// encodeLinkUrl performs CommonMark-style URL normalization: backslash
+// escapes and entities are decoded, existing percent-encoded sequences
+// are preserved (case-preserving), and any other character outside the
+// safe set is percent-encoded as its UTF-8 byte sequence.
 function encodeLinkUrl(url: string): string {
-  return url
-    .replace(/&(?!#x?[0-9a-fA-F]+;|[a-zA-Z][a-zA-Z0-9]+;)/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '%22')
-    .replace(/ /g, '%20')
+  const decoded = decodeLinkText(url)
+  let out = ''
+  let i = 0
+  while (i < decoded.length) {
+    const c = decoded[i]
+    // Preserve a well-formed `%XX` percent-encoded byte.
+    if (
+      c === '%' &&
+      i + 2 < decoded.length &&
+      /[0-9a-fA-F]/.test(decoded[i + 1]) &&
+      /[0-9a-fA-F]/.test(decoded[i + 2])
+    ) {
+      out +=
+        '%' + decoded[i + 1].toUpperCase() + decoded[i + 2].toUpperCase()
+      i += 3
+      continue
+    }
+    if (c === '&') {
+      out += '&amp;'
+      i++
+      continue
+    }
+    if (URL_SAFE.test(c)) {
+      out += c
+      i++
+      continue
+    }
+    // Percent-encode this character's UTF-8 bytes.
+    const bytes = utf8Bytes(c)
+    for (const b of bytes) {
+      out += '%' + b.toString(16).toUpperCase().padStart(2, '0')
+    }
+    i++
+  }
+  return out
+}
+
+// utf8Bytes returns the UTF-8 byte representation of a single character.
+// Handles surrogate pairs by delegating to TextEncoder for code points
+// beyond the BMP.
+function utf8Bytes(c: string): number[] {
+  const enc = new TextEncoder()
+  const bytes = enc.encode(c)
+  const out: number[] = []
+  for (let i = 0; i < bytes.length; i++) out.push(bytes[i])
+  return out
 }
 
 // innerText extracts a best-effort plain-text rendering of a segment list,
@@ -1694,7 +1773,7 @@ function processLinks(
     if (open.image) {
       const alt = innerText(nested)
       const titleAttr = title
-        ? ` title="${escapeHtmlString(title)}"`
+        ? ` title="${escapeHtmlString(decodeLinkText(title))}"`
         : ''
       html = `<img src="${encodeLinkUrl(url)}" alt="${escapeHtmlString(
         alt,
@@ -1702,7 +1781,7 @@ function processLinks(
     } else {
       const inside = renderSegments(nested)
       const titleAttr = title
-        ? ` title="${escapeHtmlString(title)}"`
+        ? ` title="${escapeHtmlString(decodeLinkText(title))}"`
         : ''
       html = `<a href="${encodeLinkUrl(url)}"${titleAttr}>${inside}</a>`
     }

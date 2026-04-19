@@ -1275,6 +1275,55 @@ func parseLinkTarget(s string, i int) (string, string, int, bool) {
 
 var reLooseAmp = regexp.MustCompile(`&(?:#x?[0-9a-fA-F]+;|[a-zA-Z][a-zA-Z0-9]*;)`)
 
+// decodeLinkText decodes backslash escapes and well-formed entity
+// references in link/title text. Invalid sequences are passed through.
+func decodeLinkText(s string) string {
+	var b strings.Builder
+	i := 0
+	n := len(s)
+	for i < n {
+		c := s[i]
+		if c == '\\' && i+1 < n && strings.IndexByte(backslashEscapable, s[i+1]) >= 0 {
+			b.WriteByte(s[i+1])
+			i += 2
+			continue
+		}
+		if c == '&' {
+			m := reEntityRef.FindStringIndex(s[i:])
+			if m != nil {
+				ref := s[i : i+m[1]]
+				if decoded, ok := decodeEntity(ref); ok {
+					b.WriteString(decoded)
+					i += m[1]
+					continue
+				}
+			}
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+// urlSafe reports whether r is preserved verbatim in CommonMark's URL
+// normalization. Other characters are percent-encoded as UTF-8.
+func urlSafe(r rune) bool {
+	switch {
+	case r >= 'A' && r <= 'Z':
+		return true
+	case r >= 'a' && r <= 'z':
+		return true
+	case r >= '0' && r <= '9':
+		return true
+	}
+	switch r {
+	case '-', '.', '_', '~', '!', '$', '&', '\'', '(', ')',
+		'*', '+', ',', ';', '=', ':', '@', '/', '?', '#':
+		return true
+	}
+	return false
+}
+
 // parseReferenceLabel parses `[label]` or `[]` starting at position i.
 func parseReferenceLabel(s string, i int) (string, bool, int, bool) {
 	if i >= len(s) || s[i] != '[' {
@@ -1570,40 +1619,78 @@ func ExtractLinkRefsAndClean(blocks []any) (LinkRefMap, []any) {
 	return refs, out
 }
 
-// encodeLinkUrl applies minimal URL normalization for href/src attributes.
+// encodeLinkUrl performs CommonMark-style URL normalization: backslash
+// escapes and entities are decoded, existing percent-encoded sequences
+// are preserved (uppercased), and any other character outside the safe
+// set is percent-encoded as its UTF-8 byte sequence.
 func encodeLinkUrl(url string) string {
-	// Preserve well-formed entities; escape bare `&`.
-	// Simple pass: replace `&` not part of an entity with `&amp;`.
-	out := ""
+	decoded := decodeLinkText(url)
+	var b strings.Builder
 	i := 0
-	for i < len(url) {
-		c := url[i]
-		if c == '&' {
-			m := reLooseAmp.FindStringIndex(url[i:])
-			if m != nil && m[0] == 0 {
-				out += url[i : i+m[1]]
-				i += m[1]
-				continue
-			}
-			out += "&amp;"
+	for i < len(decoded) {
+		// Preserve a well-formed `%XX` percent-encoded byte.
+		if decoded[i] == '%' && i+2 < len(decoded) &&
+			isHexDigit(decoded[i+1]) && isHexDigit(decoded[i+2]) {
+			b.WriteByte('%')
+			b.WriteByte(upperHex(decoded[i+1]))
+			b.WriteByte(upperHex(decoded[i+2]))
+			i += 3
+			continue
+		}
+		if decoded[i] == '&' {
+			b.WriteString("&amp;")
 			i++
 			continue
 		}
-		switch c {
-		case '<':
-			out += "&lt;"
-		case '>':
-			out += "&gt;"
-		case '"':
-			out += "%22"
-		case ' ':
-			out += "%20"
-		default:
-			out += string(c)
+		r, size := decodeRune(decoded, i)
+		if size == 1 && r < 128 && urlSafe(r) {
+			b.WriteByte(byte(r))
+			i++
+			continue
 		}
-		i++
+		// Percent-encode the UTF-8 bytes for this character.
+		for k := 0; k < size; k++ {
+			fmt.Fprintf(&b, "%%%02X", decoded[i+k])
+		}
+		i += size
 	}
-	return out
+	return b.String()
+}
+
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+func upperHex(b byte) byte {
+	if b >= 'a' && b <= 'f' {
+		return b - 32
+	}
+	return b
+}
+
+// decodeRune returns the rune at i and its UTF-8 byte length. Uses
+// utf8.DecodeRuneInString to honor multi-byte characters.
+func decodeRune(s string, i int) (rune, int) {
+	if i >= len(s) {
+		return 0, 0
+	}
+	b := s[i]
+	if b < 0x80 {
+		return rune(b), 1
+	}
+	// Minimal UTF-8 decoder.
+	switch {
+	case b&0xE0 == 0xC0 && i+1 < len(s):
+		r := rune(b&0x1F)<<6 | rune(s[i+1]&0x3F)
+		return r, 2
+	case b&0xF0 == 0xE0 && i+2 < len(s):
+		r := rune(b&0x0F)<<12 | rune(s[i+1]&0x3F)<<6 | rune(s[i+2]&0x3F)
+		return r, 3
+	case b&0xF8 == 0xF0 && i+3 < len(s):
+		r := rune(b&0x07)<<18 | rune(s[i+1]&0x3F)<<12 | rune(s[i+2]&0x3F)<<6 | rune(s[i+3]&0x3F)
+		return r, 4
+	}
+	return rune(b), 1
 }
 
 // innerText extracts a best-effort plain-text rendering of a segment list,
@@ -1993,7 +2080,7 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 			alt := innerText(inner)
 			titleAttr := ""
 			if title != "" {
-				titleAttr = ` title="` + escapeHTMLString(title) + `"`
+				titleAttr = ` title="` + escapeHTMLString(decodeLinkText(title)) + `"`
 			}
 			html = `<img src="` + encodeLinkUrl(url) + `" alt="` +
 				escapeHTMLString(alt) + `"` + titleAttr + " />"
@@ -2001,7 +2088,7 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 			inside := renderSegments(inner)
 			titleAttr := ""
 			if title != "" {
-				titleAttr = ` title="` + escapeHTMLString(title) + `"`
+				titleAttr = ` title="` + escapeHTMLString(decodeLinkText(title)) + `"`
 			}
 			html = `<a href="` + encodeLinkUrl(url) + `"` + titleAttr +
 				">" + inside + "</a>"
