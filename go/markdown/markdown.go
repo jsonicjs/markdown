@@ -379,6 +379,14 @@ var (
 	)
 )
 
+// Fenced code block regexes. Backtick and tilde fences are matched
+// separately so the info-string restriction can apply only to backticks.
+var (
+	reFenceOpen       = regexp.MustCompile("^( {0,3})(`{3,}|~{3,})(.*)$")
+	reFenceCloseBack  = regexp.MustCompile("^ {0,3}(`{3,})[ \\t]*$")
+	reFenceCloseTilde = regexp.MustCompile(`^ {0,3}(~{3,})[ \t]*$`)
+)
+
 // isHorizontalRule reports whether s is a markdown horizontal rule line:
 // at most 3 leading spaces/tabs, then 3+ of the same `-`, `*`, or `_`
 // character (with optional spaces/tabs between), and only spaces/tabs after.
@@ -529,40 +537,73 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				tkn = lex.Token("#MHB", tinFor(lex, "#MHB"), htmlText, srcPart)
 				kind = "htmlblock"
 
-			// Fenced code block.
-			case strings.HasPrefix(stripIndent(lineContent), fence):
-				stripped := stripIndent(lineContent)
-				lang := strings.TrimSpace(stripped[len(fence):])
-				codeLines := []string{}
-				codeEnd := consumeEnd
+			// Fenced code block: 3+ backticks or 3+ tildes with up to 3
+			// leading spaces. Close must use same char, length >= open.
+			case reFenceOpen.MatchString(lineContent):
+				m := reFenceOpen.FindStringSubmatch(lineContent)
+				openIndent := len(m[1])
+				fenceRun := m[2]
+				fenceChar := fenceRun[0]
+				fenceLen := len(fenceRun)
+				infoRaw := m[3]
+				if fenceChar == '`' && strings.IndexByte(infoRaw, '`') >= 0 {
+					// Back-tick fence with backtick in info: fall through
+					// to text.
+					srcPart := src[sI:consumeEnd]
+					tkn = lex.Token("#MT", tinFor(lex, "#MT"), lineContent, srcPart)
+					kind = "text"
+				} else {
+					lang := strings.TrimSpace(infoRaw)
+					if idx := strings.IndexAny(lang, " \t"); idx >= 0 {
+						lang = lang[:idx]
+					}
+					codeLines := []string{}
+					codeEnd := consumeEnd
 
-				for codeEnd < srclen {
-					innerEnd := codeEnd
-					for innerEnd < srclen && src[innerEnd] != '\n' {
-						innerEnd++
-					}
-					innerLine := src[codeEnd:innerEnd]
-					if strings.HasSuffix(innerLine, "\r") {
-						innerLine = innerLine[:len(innerLine)-1]
-					}
-					nextEnd := innerEnd
-					if innerEnd < srclen {
-						nextEnd = innerEnd + 1
-					}
-					if strings.HasPrefix(stripIndent(innerLine), fence) {
+					for codeEnd < srclen {
+						innerEnd := codeEnd
+						for innerEnd < srclen && src[innerEnd] != '\n' {
+							innerEnd++
+						}
+						innerLine := src[codeEnd:innerEnd]
+						if strings.HasSuffix(innerLine, "\r") {
+							innerLine = innerLine[:len(innerLine)-1]
+						}
+						nextEnd := innerEnd
+						if innerEnd < srclen {
+							nextEnd = innerEnd + 1
+						}
+
+						var closeRe *regexp.Regexp
+						if fenceChar == '`' {
+							closeRe = reFenceCloseBack
+						} else {
+							closeRe = reFenceCloseTilde
+						}
+						if cm := closeRe.FindStringSubmatch(innerLine); cm != nil {
+							if len(cm[1]) >= fenceLen {
+								codeEnd = nextEnd
+								break
+							}
+						}
+
+						strip := 0
+						for strip < openIndent &&
+							strip < len(innerLine) &&
+							innerLine[strip] == ' ' {
+							strip++
+						}
+						codeLines = append(codeLines, innerLine[strip:])
 						codeEnd = nextEnd
-						break
 					}
-					codeLines = append(codeLines, innerLine)
-					codeEnd = nextEnd
-				}
 
-				codeText := strings.Join(codeLines, "\n")
-				consumeEnd = codeEnd
-				srcPart := src[sI:consumeEnd]
-				val := map[string]any{"lang": lang, "text": codeText}
-				tkn = lex.Token("#MC", tinFor(lex, "#MC"), val, srcPart)
-				kind = "code"
+					codeText := strings.Join(codeLines, "\n")
+					consumeEnd = codeEnd
+					srcPart := src[sI:consumeEnd]
+					val := map[string]any{"lang": lang, "text": codeText}
+					tkn = lex.Token("#MC", tinFor(lex, "#MC"), val, srcPart)
+					kind = "code"
+				}
 
 			// ATX heading: 0-3 leading spaces, 1-6 `#`, optional space+text,
 			// optional trailing `#` sequence preceded by whitespace.

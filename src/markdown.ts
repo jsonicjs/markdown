@@ -405,40 +405,73 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         kind = 'htmlblock'
       }
 
-      // Fenced code block start.
-      else if (stripIndent(lineContent).startsWith(fence)) {
-        const stripped = stripIndent(lineContent)
-        const lang = stripped.substring(fence.length).trim()
-        const codeLines: string[] = []
-        let codeEnd = consumeEnd
-        let closed = false
+      // Fenced code block start: 3+ backticks or 3+ tildes with up to 3
+      // leading spaces. The closing fence must use the same character and
+      // be at least as long. The opening fence's indentation is stripped
+      // from content lines where present.
+      else if (/^ {0,3}(?:`{3,}|~{3,})/.test(lineContent)) {
+        const open = lineContent.match(
+          /^( {0,3})(`{3,}|~{3,})(.*)$/,
+        )
+        if (!open) {
+          // Fall through to text.
+          srcPart = src.substring(sI, consumeEnd)
+          tkn = lex.token('#MT', lineContent, srcPart, pnt)
+          kind = 'text'
+        } else {
+          const openIndent = open[1].length
+          const fenceRun = open[2]
+          const fenceChar = fenceRun[0]
+          const fenceLen = fenceRun.length
+          const infoRaw = open[3]
+          // For backtick fences, the info string must not contain backticks.
+          if (fenceChar === '`' && infoRaw.indexOf('`') >= 0) {
+            srcPart = src.substring(sI, consumeEnd)
+            tkn = lex.token('#MT', lineContent, srcPart, pnt)
+            kind = 'text'
+          } else {
+            const lang = infoRaw.trim().split(/\s+/)[0] || ''
+            const codeLines: string[] = []
+            let codeEnd = consumeEnd
 
-        while (codeEnd < srclen) {
-          let innerEnd = codeEnd
-          while (innerEnd < srclen && src[innerEnd] !== '\n') innerEnd++
-          let innerLine = src.substring(codeEnd, innerEnd)
-          if (innerLine.endsWith('\r')) innerLine = innerLine.slice(0, -1)
+            while (codeEnd < srclen) {
+              let innerEnd = codeEnd
+              while (innerEnd < srclen && src[innerEnd] !== '\n') innerEnd++
+              let innerLine = src.substring(codeEnd, innerEnd)
+              if (innerLine.endsWith('\r')) innerLine = innerLine.slice(0, -1)
 
-          const nextEnd = innerEnd < srclen ? innerEnd + 1 : innerEnd
+              const nextEnd = innerEnd < srclen ? innerEnd + 1 : innerEnd
 
-          if (stripIndent(innerLine).startsWith(fence)) {
-            codeEnd = nextEnd
-            closed = true
-            break
+              const closeMatch = innerLine.match(
+                fenceChar === '`'
+                  ? /^ {0,3}(`{3,})[ \t]*$/
+                  : /^ {0,3}(~{3,})[ \t]*$/,
+              )
+              if (closeMatch && closeMatch[1].length >= fenceLen) {
+                codeEnd = nextEnd
+                break
+              }
+
+              // Strip up to openIndent leading spaces.
+              let strip = 0
+              while (
+                strip < openIndent &&
+                strip < innerLine.length &&
+                innerLine[strip] === ' '
+              ) {
+                strip++
+              }
+              codeLines.push(innerLine.slice(strip))
+              codeEnd = nextEnd
+            }
+
+            const codeText = codeLines.join('\n')
+            consumeEnd = codeEnd
+            srcPart = src.substring(sI, consumeEnd)
+            tkn = lex.token('#MC', { lang, text: codeText }, srcPart, pnt)
+            kind = 'code'
           }
-          codeLines.push(innerLine)
-          codeEnd = nextEnd
         }
-
-        // If the fence was never closed, still produce a code block from what
-        // we captured rather than erroring.
-        void closed
-
-        const codeText = codeLines.join('\n')
-        consumeEnd = codeEnd
-        srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#MC', { lang, text: codeText }, srcPart, pnt)
-        kind = 'code'
       }
 
       // ATX heading: up to 3 leading spaces, 1-6 `#`, then space+text or end

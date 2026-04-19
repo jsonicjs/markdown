@@ -25,8 +25,8 @@ import (
 
 // minCommonMarkPasses is the regression floor. Bump upward as the parser
 // improves; never decrease without an explanation in the commit.
-// Current baseline: 464/652 (step 8: link reference definitions).
-const minCommonMarkPasses = 455
+// Current baseline: 482/652 (step 9: fenced code refinements).
+const minCommonMarkPasses = 475
 
 type commonMarkCase struct {
 	Markdown  string `json:"markdown"`
