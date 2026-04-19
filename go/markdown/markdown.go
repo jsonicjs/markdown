@@ -329,10 +329,15 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			items, _ := cur["items"].([]any)
 			last, _ := items[len(items)-1].(map[string]any)
 			text, _ := last["text"].(string)
+			// CM: a lazy continuation line cannot start a new block
+			// inside the list item's paragraph. Re-indent with four
+			// spaces so the item's sub-parse treats it as lazy
+			// paragraph text (spec example 312).
+			line := "    " + v
 			if text == "" {
-				last["text"] = v
+				last["text"] = line
 			} else {
-				last["text"] = text + "\n" + v
+				last["text"] = text + "\n" + line
 			}
 		}),
 
@@ -756,6 +761,7 @@ var (
 	reOrderedBare   = regexp.MustCompile(`^( {0,3})(\d{1,9})([.)])[ \t]*$`)
 	reUnorderedBare     = regexp.MustCompile(`^( {0,3})[-*+][ \t]*$`)
 	reBlockquote        = regexp.MustCompile(`^ {0,3}>( ?)(.*)$`)
+	reBlockquoteStart   = regexp.MustCompile(`^ {0,3}>`)
 	reOrderedFullStart1 = regexp.MustCompile(`^ {0,3}1[.)][ \t]`)
 	reLabelBlankLine    = regexp.MustCompile(`\n[ \t]*\n`)
 	reQuoteFenceStart   = regexp.MustCompile("^ {0,3}(?:`{3,}|~{3,})")
@@ -774,6 +780,32 @@ func computeListItem(markerEnd, spacesAfter int, rest string) (int, string) {
 		return markerEnd + 1, strings.Repeat(" ", spacesAfter-1) + rest
 	}
 	return markerEnd + spacesAfter, rest
+}
+
+// expandMarkerTabs normalises the spaces/tabs following a list marker.
+// Per CommonMark spec example 7, a tab after the marker expands to
+// virtual spaces up to the next 4-column tab stop; if the expanded
+// width is >= 5 (or blank), the effective padding is 1 and the surplus
+// spills into the content so nested indented-code blocks (`-\t\tfoo`)
+// line up correctly.
+func expandMarkerTabs(padding, rest string, markerEndCol int) (int, string) {
+	col := markerEndCol
+	virtual := 0
+	for i := 0; i < len(padding); i++ {
+		ch := padding[i]
+		if ch == ' ' {
+			virtual++
+			col++
+		} else if ch == '\t' {
+			fill := 4 - (col % 4)
+			virtual += fill
+			col += fill
+		}
+	}
+	if virtual >= 5 || rest == "" {
+		return 1, strings.Repeat(" ", virtual-1) + rest
+	}
+	return virtual, rest
 }
 
 // stripIndent removes up to 3 leading spaces from a line. CommonMark allows
@@ -1143,7 +1175,8 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 					reOrderedFullStart1.MatchString(lineContent)):
 				m := reOrderedFull.FindStringSubmatch(lineContent)
 				markerEnd := len(m[1]) + len(m[2]) + 1
-				cc, text := computeListItem(markerEnd, len(m[4]), m[5])
+				spaces, rest := expandMarkerTabs(m[4], m[5], markerEnd)
+				cc, text := computeListItem(markerEnd, spaces, rest)
 				state.listContentCol = cc
 				start := 0
 				fmt.Sscanf(m[2], "%d", &start)
@@ -1161,7 +1194,8 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			case reUnorderedFull.MatchString(lineContent):
 				m := reUnorderedFull.FindStringSubmatch(lineContent)
 				markerEnd := len(m[1]) + len(m[2])
-				cc, text := computeListItem(markerEnd, len(m[3]), m[4])
+				spaces, rest := expandMarkerTabs(m[3], m[4], markerEnd)
+				cc, text := computeListItem(markerEnd, spaces, rest)
 				state.listContentCol = cc
 				val := map[string]any{
 					"ordered":  false,
@@ -1201,11 +1235,38 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
 
-			// Blockquote line.
-			case reBlockquote.MatchString(lineContent):
-				m := reBlockquote.FindStringSubmatch(lineContent)
+			// Blockquote line. Tabs in the content's leading whitespace
+			// expand relative to the column AFTER the marker so the
+			// optional single space can consume one virtual column of
+			// a tab and the remainder stays as content (spec example 6).
+			case reBlockquoteStart.MatchString(lineContent):
+				prefix := reBlockquoteStart.FindString(lineContent)
+				rest := lineContent[len(prefix):]
+				col := len(prefix)
+				var expanded strings.Builder
+				j := 0
+				for j < len(rest) {
+					ch := rest[j]
+					if ch == ' ' {
+						expanded.WriteByte(' ')
+						col++
+						j++
+					} else if ch == '\t' {
+						fill := 4 - (col % 4)
+						expanded.WriteString(strings.Repeat(" ", fill))
+						col += fill
+						j++
+					} else {
+						break
+					}
+				}
+				expanded.WriteString(rest[j:])
+				content := expanded.String()
+				if len(content) > 0 && content[0] == ' ' {
+					content = content[1:]
+				}
 				srcPart := src[sI:consumeEnd]
-				tkn = lex.Token("#MQ", tinFor(lex, "#MQ"), m[2], srcPart)
+				tkn = lex.Token("#MQ", tinFor(lex, "#MQ"), content, srcPart)
 				kind = "quote"
 
 			// Indented line (4+ spaces or tab): indented code block,

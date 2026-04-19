@@ -320,8 +320,13 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       const block = ctx.u.mdCurrent
       const items = block.items
       const last = items[items.length - 1]
-      if (last.text.length === 0) last.text = v
-      else last.text += '\n' + v
+      // CM: a lazy continuation line cannot start a new block inside
+      // the list item's paragraph. Re-indent with four spaces so the
+      // item's sub-parse treats the line as lazy paragraph text rather
+      // than a fresh list / heading / fence (spec example 312).
+      const line = '    ' + v
+      if (last.text.length === 0) last.text = line
+      else last.text += '\n' + line
     },
 
 
@@ -555,6 +560,40 @@ function stripIndent(s: string): string {
   let i = 0
   while (i < 3 && i < s.length && s[i] === ' ') i++
   return s.slice(i)
+}
+
+// expandMarkerTabs normalises the spaces/tabs that follow a list marker.
+// Per CommonMark § 2.2 and spec example 7, tabs in the whitespace that
+// separates the marker from content expand to virtual spaces (up to the
+// next 4-column tab stop). The "indented code in item" rule (spec § 5.2
+// rule 2) says that if this virtual width is >= 5 or empty/blank, the
+// marker's effective padding is 1 and the REMAINING virtual spaces stay
+// in the content — this is how `-\t\tfoo` produces a `<pre><code>  foo`
+// indented code block inside the item.
+function expandMarkerTabs(
+  padding: string,
+  rest: string,
+  markerEndCol: number,
+): { spaces: number; rest: string } {
+  let col = markerEndCol
+  let virtual = 0
+  for (let i = 0; i < padding.length; i++) {
+    const ch = padding[i]
+    if (ch === ' ') {
+      virtual++
+      col++
+    } else if (ch === '\t') {
+      const fill = 4 - (col % 4)
+      virtual += fill
+      col += fill
+    }
+  }
+  if (virtual >= 5 || rest.length === 0) {
+    // Padding becomes exactly one column; the surplus spills into the
+    // content so its further tab expansion starts at the right column.
+    return { spaces: 1, rest: ' '.repeat(virtual - 1) + rest }
+  }
+  return { spaces: virtual, rest }
 }
 
 // expandLeadingTabs replaces tabs in the line's leading whitespace with
@@ -887,10 +926,15 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
           /^ {0,3}1[.)][ \t]/.test(lineContent))
       ) {
         const m = lineContent.match(/^( {0,3})(\d{1,9})([.)])([ \t]+)(.*)$/)!
+        const after = expandMarkerTabs(
+          m[4],
+          m[5],
+          m[1].length + m[2].length + 1,
+        )
         const result = computeListItem(
           m[1].length + m[2].length + 1,
-          m[4].length,
-          m[5],
+          after.spaces,
+          after.rest,
         )
         state.listContentCol = result.contentCol
         const start = parseInt(m[2], 10)
@@ -908,10 +952,15 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       // Unordered list item.
       else if (/^ {0,3}[-*+][ \t]/.test(lineContent)) {
         const m = lineContent.match(/^( {0,3})([-*+])([ \t]+)(.*)$/)!
+        const after = expandMarkerTabs(
+          m[3],
+          m[4],
+          m[1].length + m[2].length,
+        )
         const result = computeListItem(
           m[1].length + m[2].length,
-          m[3].length,
-          m[4],
+          after.spaces,
+          after.rest,
         )
         state.listContentCol = result.contentCol
         const markerId = 'u' + m[2]
@@ -965,11 +1014,36 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
 
       // Blockquote line. CommonMark allows up to 3 leading spaces before
       // the `>`, and optionally one space after it (which is not included
-      // in the content).
+      // in the content). Tabs in the content's leading whitespace are
+      // expanded relative to the column AFTER the marker so the blockquote
+      // sees proper virtual-column indentation (spec example 6).
       else if (/^ {0,3}>/.test(lineContent)) {
-        const m = lineContent.match(/^ {0,3}>( ?)(.*)$/)!
+        const prefix = lineContent.match(/^ {0,3}>/)![0]
+        const rest = lineContent.slice(prefix.length)
+        let col = prefix.length
+        let j = 0
+        let expanded = ''
+        while (j < rest.length) {
+          const ch = rest[j]
+          if (ch === ' ') {
+            expanded += ' '
+            col++
+            j++
+          } else if (ch === '\t') {
+            const spaces = 4 - (col % 4)
+            expanded += ' '.repeat(spaces)
+            col += spaces
+            j++
+          } else {
+            break
+          }
+        }
+        expanded += rest.slice(j)
+        const content = expanded.length > 0 && expanded[0] === ' '
+          ? expanded.slice(1)
+          : expanded
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#MQ', m[2], srcPart, pnt)
+        tkn = lex.token('#MQ', content, srcPart, pnt)
         kind = 'quote'
       }
 

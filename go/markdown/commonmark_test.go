@@ -25,8 +25,8 @@ import (
 
 // minCommonMarkPasses is the regression floor. Bump upward as the parser
 // improves; never decrease without an explanation in the commit.
-// Current baseline: 648/652 (step 43: fenced-code opener breaks quote lazy).
-const minCommonMarkPasses = 645
+// Current baseline: 651/652 (step 45: partial-tab in container markers).
+const minCommonMarkPasses = 648
 
 type commonMarkCase struct {
 	Markdown  string `json:"markdown"`
