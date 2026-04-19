@@ -104,7 +104,7 @@ const grammarText = `
   rule: list-tail-blank: open: [
     { s: '#ML'  a: '@list-append' r: list-tail g: 'md,list,blank,item' }
     { s: '#MLC' a: '@list-cont'   r: list-tail g: 'md,list,blank,cont' }
-    { s: '#MB'  r: list-tail-blank g: 'md,list,blank,more' }
+    { s: '#MB'  a: '@list-blank'  r: list-tail-blank g: 'md,list,blank,more' }
     { g: 'md,list,blank,end' }
   ]
 
