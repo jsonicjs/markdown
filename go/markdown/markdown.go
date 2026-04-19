@@ -683,19 +683,22 @@ var Defaults = map[string]any{
 }
 
 // RenderHTML produces a CommonMark-style HTML fragment for a single block.
-// Block text is routed through renderInline so backslash escapes, entity
-// references, and hard line breaks are handled. Inline emphasis, links,
-// code spans, and autolinks are not yet implemented.
+// Block text is routed through renderInline. A non-nil refs map resolves
+// reference-style links.
 func RenderHTML(block map[string]any) string {
+	return renderBlockHTML(block, nil)
+}
+
+func renderBlockHTML(block map[string]any, refs LinkRefMap) string {
 	switch block["type"] {
 	case "heading":
 		level, _ := block["level"].(int)
 		text, _ := block["text"].(string)
-		return fmt.Sprintf("<h%d>%s</h%d>", level, renderInline(text), level)
+		return fmt.Sprintf("<h%d>%s</h%d>", level, renderInline(text, refs), level)
 
 	case "paragraph":
 		text, _ := block["text"].(string)
-		return "<p>" + renderInline(text) + "</p>"
+		return "<p>" + renderInline(text, refs) + "</p>"
 
 	case "hr":
 		return "<hr />"
@@ -730,7 +733,7 @@ func RenderHTML(block map[string]any) string {
 			m, _ := it.(map[string]any)
 			text, _ := m["text"].(string)
 			b.WriteString("<li>")
-			b.WriteString(renderInline(text))
+			b.WriteString(renderInline(text, refs))
 			b.WriteString("</li>")
 		}
 		b.WriteString("\n</")
@@ -740,7 +743,11 @@ func RenderHTML(block map[string]any) string {
 
 	case "blockquote":
 		text, _ := block["text"].(string)
-		return "<blockquote>\n<p>" + renderInline(text) + "</p>\n</blockquote>"
+		return "<blockquote>\n<p>" + renderInline(text, refs) + "</p>\n</blockquote>"
+
+	case "html":
+		text, _ := block["text"].(string)
+		return text
 	}
 	return ""
 }
@@ -840,6 +847,9 @@ const (
 // atoms (code span output, decoded entities, escape output, hard breaks);
 // delim segments are `*`/`_` runs that the emphasis pass may consume;
 // bracket segments are `[`, `![`, or `]` markers consumed by the link pass.
+// A closing bracket may carry either inline target info (url/title) or
+// reference info (refLabel filled = full, refCollapsed = `[]`,
+// refShortcut = bare `[text]`).
 type inlineSeg struct {
 	kind     inlineSegKind
 	value    string
@@ -848,13 +858,26 @@ type inlineSeg struct {
 	canOpen  bool
 	canClose bool
 	// Bracket-specific:
-	open   bool
-	image  bool
-	active bool
-	url    string
-	title  string
-	hasURL bool
+	open         bool
+	image        bool
+	active       bool
+	url          string
+	title        string
+	hasURL       bool
+	refLabel     string
+	refCollapsed bool
+	refShortcut  bool
+	hasRef       bool
 }
+
+// LinkRef is a link reference definition extracted from the block list.
+type LinkRef struct {
+	URL   string
+	Title string
+}
+
+// LinkRefMap is label (normalized) to definition mapping.
+type LinkRefMap = map[string]LinkRef
 
 // asciiPunct reports whether b is an ASCII punctuation character used by
 // CommonMark's flanking classification (approximation; the full spec uses
@@ -965,6 +988,301 @@ func parseLinkTarget(s string, i int) (string, string, int, bool) {
 }
 
 var reLooseAmp = regexp.MustCompile(`&(?:#x?[0-9a-fA-F]+;|[a-zA-Z][a-zA-Z0-9]*;)`)
+
+// parseReferenceLabel parses `[label]` or `[]` starting at position i.
+func parseReferenceLabel(s string, i int) (string, bool, int, bool) {
+	if i >= len(s) || s[i] != '[' {
+		return "", false, 0, false
+	}
+	j := i + 1
+	var lb strings.Builder
+	for j < len(s) && s[j] != ']' {
+		if s[j] == '\\' && j+1 < len(s) {
+			lb.WriteByte(s[j])
+			lb.WriteByte(s[j+1])
+			j += 2
+			continue
+		}
+		if s[j] == '[' {
+			return "", false, 0, false
+		}
+		lb.WriteByte(s[j])
+		j++
+	}
+	if j >= len(s) || s[j] != ']' {
+		return "", false, 0, false
+	}
+	label := lb.String()
+	collapsed := strings.TrimSpace(label) == ""
+	return label, collapsed, j + 1, true
+}
+
+// normalizeLinkLabel applies CommonMark's label equality rule: strip
+// leading/trailing whitespace, collapse interior whitespace to single
+// spaces, case-fold via ToLower.
+func normalizeLinkLabel(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ToLower(s)
+	// Collapse any run of whitespace to a single space.
+	var b strings.Builder
+	inWS := false
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if !inWS {
+				b.WriteByte(' ')
+				inWS = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		inWS = false
+	}
+	return b.String()
+}
+
+// parseLinkRefDef attempts to match `[label]: destination[ "title"]` at
+// the start of text and returns (label, url, title, length, true).
+func parseLinkRefDef(text string) (string, string, string, int, bool) {
+	i := 0
+	// Up to 3 leading spaces.
+	for i < len(text) && i < 3 && text[i] == ' ' {
+		i++
+	}
+	if i >= len(text) || text[i] != '[' {
+		return "", "", "", 0, false
+	}
+	i++
+	var lb strings.Builder
+	labelEnd := -1
+	for i < len(text) {
+		c := text[i]
+		if c == '\n' {
+			lb.WriteByte(c)
+			i++
+			if strings.Count(lb.String(), "\n") > 1 {
+				return "", "", "", 0, false
+			}
+			continue
+		}
+		if c == ']' {
+			labelEnd = i
+			break
+		}
+		if c == '\\' && i+1 < len(text) {
+			lb.WriteByte(text[i+1])
+			i += 2
+			continue
+		}
+		if c == '[' {
+			return "", "", "", 0, false
+		}
+		lb.WriteByte(c)
+		i++
+	}
+	if labelEnd < 0 {
+		return "", "", "", 0, false
+	}
+	label := lb.String()
+	if strings.TrimSpace(label) == "" {
+		return "", "", "", 0, false
+	}
+	i = labelEnd + 1
+	if i >= len(text) || text[i] != ':' {
+		return "", "", "", 0, false
+	}
+	i++
+	// Optional whitespace (at most one newline).
+	nls := 0
+	for i < len(text) {
+		c := text[i]
+		if c == ' ' || c == '\t' {
+			i++
+			continue
+		}
+		if c == '\n' || c == '\r' {
+			if c == '\n' {
+				nls++
+				if nls > 1 {
+					return "", "", "", 0, false
+				}
+			}
+			i++
+			continue
+		}
+		break
+	}
+	// URL.
+	var urlB strings.Builder
+	if i < len(text) && text[i] == '<' {
+		k := i + 1
+		for k < len(text) && text[k] != '>' && text[k] != '\n' && text[k] != '<' {
+			if text[k] == '\\' && k+1 < len(text) {
+				urlB.WriteByte(text[k+1])
+				k += 2
+				continue
+			}
+			urlB.WriteByte(text[k])
+			k++
+		}
+		if k >= len(text) || text[k] != '>' {
+			return "", "", "", 0, false
+		}
+		i = k + 1
+	} else {
+		for i < len(text) {
+			c := text[i]
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+				break
+			}
+			if c < 0x20 || c == 0x7f {
+				break
+			}
+			if c == '\\' && i+1 < len(text) {
+				urlB.WriteByte(text[i+1])
+				i += 2
+				continue
+			}
+			urlB.WriteByte(c)
+			i++
+		}
+		if urlB.Len() == 0 {
+			return "", "", "", 0, false
+		}
+	}
+
+	// Optional title.
+	title := ""
+	titleEnd := i
+	j := i
+	for j < len(text) && (text[j] == ' ' || text[j] == '\t') {
+		j++
+	}
+	hadNewline := false
+	if j < len(text) && text[j] == '\n' {
+		j++
+		hadNewline = true
+		for j < len(text) && (text[j] == ' ' || text[j] == '\t') {
+			j++
+		}
+	}
+	_ = hadNewline
+	if j < len(text) && (text[j] == '"' || text[j] == '\'' || text[j] == '(') {
+		openQ := text[j]
+		closeQ := openQ
+		if openQ == '(' {
+			closeQ = ')'
+		}
+		k := j + 1
+		var tb strings.Builder
+		ok := false
+		nls2 := 0
+		for k < len(text) {
+			c := text[k]
+			if c == '\\' && k+1 < len(text) {
+				tb.WriteByte(text[k+1])
+				k += 2
+				continue
+			}
+			if c == closeQ {
+				ok = true
+				break
+			}
+			if c == '\n' {
+				nls2++
+				if nls2 > 1 {
+					break
+				}
+			}
+			if openQ == '(' && c == '(' {
+				break
+			}
+			tb.WriteByte(c)
+			k++
+		}
+		if ok {
+			candidate := tb.String()
+			endAfter := k + 1
+			m := endAfter
+			valid := true
+			for m < len(text) && text[m] != '\n' {
+				if text[m] != ' ' && text[m] != '\t' {
+					valid = false
+					break
+				}
+				m++
+			}
+			if valid {
+				title = candidate
+				titleEnd = endAfter
+			}
+		}
+	}
+
+	end := titleEnd
+	for end < len(text) && (text[end] == ' ' || text[end] == '\t') {
+		end++
+	}
+	if end < len(text) && text[end] != '\n' {
+		if title != "" {
+			// Title invalid in trailing position; back out.
+			title = ""
+			end = i
+			for end < len(text) && (end < len(text) && (text[end] == ' ' || text[end] == '\t')) {
+				end++
+			}
+			if end < len(text) && text[end] != '\n' {
+				return "", "", "", 0, false
+			}
+		} else {
+			return "", "", "", 0, false
+		}
+	}
+	if end < len(text) && text[end] == '\n' {
+		end++
+	}
+	return label, urlB.String(), title, end, true
+}
+
+// ExtractLinkRefsAndClean pulls leading `[label]: url "title"` definitions
+// from paragraph blocks and returns the ref map plus the surviving blocks.
+func ExtractLinkRefsAndClean(blocks []any) (LinkRefMap, []any) {
+	refs := LinkRefMap{}
+	out := make([]any, 0, len(blocks))
+	for _, v := range blocks {
+		b, ok := v.(map[string]any)
+		if !ok {
+			out = append(out, v)
+			continue
+		}
+		if t, _ := b["type"].(string); t != "paragraph" {
+			out = append(out, v)
+			continue
+		}
+		text, _ := b["text"].(string)
+		for {
+			label, url, title, length, matched := parseLinkRefDef(text)
+			if !matched {
+				break
+			}
+			norm := normalizeLinkLabel(label)
+			if norm != "" {
+				if _, exists := refs[norm]; !exists {
+					refs[norm] = LinkRef{URL: url, Title: title}
+				}
+			}
+			text = text[length:]
+		}
+		if len(text) > 0 {
+			nb := map[string]any{}
+			for k, v := range b {
+				nb[k] = v
+			}
+			nb["text"] = text
+			out = append(out, nb)
+		}
+	}
+	return refs, out
+}
 
 // encodeLinkUrl applies minimal URL normalization for href/src attributes.
 func encodeLinkUrl(url string) string {
@@ -1218,8 +1536,8 @@ func tokenizeInline(s string) []*inlineSeg {
 			continue
 		}
 
-		// Link close `]` — if followed by `(url[ "title"])`, consume and
-		// stash the parsed target on the bracket segment.
+		// Link close `]` — try inline target, then reference label,
+		// then fall back to a shortcut reference marker.
 		if c == ']' {
 			if url, title, end, ok := parseLinkTarget(s, i+1); ok {
 				segs = append(segs, &inlineSeg{
@@ -1231,14 +1549,31 @@ func tokenizeInline(s string) []*inlineSeg {
 					hasURL: true,
 				})
 				i = end
-			} else {
-				segs = append(segs, &inlineSeg{
-					kind:   segBracket,
-					open:   false,
-					active: true,
-				})
-				i++
+				continue
 			}
+			if label, collapsed, end, ok := parseReferenceLabel(s, i+1); ok {
+				seg := &inlineSeg{
+					kind:         segBracket,
+					open:         false,
+					active:       true,
+					refCollapsed: collapsed,
+					hasRef:       true,
+				}
+				if !collapsed {
+					seg.refLabel = label
+				}
+				segs = append(segs, seg)
+				i = end
+				continue
+			}
+			segs = append(segs, &inlineSeg{
+				kind:        segBracket,
+				open:        false,
+				active:      true,
+				refShortcut: true,
+				hasRef:      true,
+			})
+			i++
 			continue
 		}
 
@@ -1308,14 +1643,14 @@ func tokenizeInline(s string) []*inlineSeg {
 }
 
 // processLinks walks the segment list forward, matching each link/image
-// closing bracket (that carries a parsed inline URL) with the most recent
-// active opener, and replacing the span with a single html segment
-// wrapping the rendered inner content in an <a> or <img> element.
-func processLinks(segs []*inlineSeg) []*inlineSeg {
+// closing bracket with the most recent active opener. Inline links
+// (carrying a parsed URL) resolve directly; reference-style brackets
+// resolve their label through the supplied refs map.
+func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 	i := 0
 	for i < len(segs) {
 		close := segs[i]
-		if close.kind != segBracket || close.open || !close.hasURL {
+		if close.kind != segBracket || close.open {
 			i++
 			continue
 		}
@@ -1335,25 +1670,54 @@ func processLinks(segs []*inlineSeg) []*inlineSeg {
 
 		op := segs[openIdx]
 		inner := append([]*inlineSeg{}, segs[openIdx+1:i]...)
-		inner = processLinks(inner)
+
+		var url, title string
+		hasTarget := false
+		if close.hasURL {
+			url = close.url
+			title = close.title
+			hasTarget = true
+		} else if close.hasRef && refs != nil {
+			var label string
+			if close.refLabel != "" {
+				label = close.refLabel
+			} else if close.refCollapsed || close.refShortcut {
+				label = innerText(inner)
+			}
+			if label != "" {
+				if ref, ok := refs[normalizeLinkLabel(label)]; ok {
+					url = ref.URL
+					title = ref.Title
+					hasTarget = true
+				}
+			}
+		}
+
+		if !hasTarget {
+			op.active = false
+			i++
+			continue
+		}
+
+		inner = processLinks(inner, refs)
 		inner = processEmphasis(inner)
 
 		var html string
 		if op.image {
 			alt := innerText(inner)
 			titleAttr := ""
-			if close.title != "" {
-				titleAttr = ` title="` + escapeHTMLString(close.title) + `"`
+			if title != "" {
+				titleAttr = ` title="` + escapeHTMLString(title) + `"`
 			}
-			html = `<img src="` + encodeLinkUrl(close.url) + `" alt="` +
+			html = `<img src="` + encodeLinkUrl(url) + `" alt="` +
 				escapeHTMLString(alt) + `"` + titleAttr + " />"
 		} else {
 			inside := renderSegments(inner)
 			titleAttr := ""
-			if close.title != "" {
-				titleAttr = ` title="` + escapeHTMLString(close.title) + `"`
+			if title != "" {
+				titleAttr = ` title="` + escapeHTMLString(title) + `"`
 			}
-			html = `<a href="` + encodeLinkUrl(close.url) + `"` + titleAttr +
+			html = `<a href="` + encodeLinkUrl(url) + `"` + titleAttr +
 				">" + inside + "</a>"
 		}
 
@@ -1361,7 +1725,6 @@ func processLinks(segs []*inlineSeg) []*inlineSeg {
 		tail := append([]*inlineSeg{}, segs[i+1:]...)
 		segs = append(segs[:openIdx], append([]*inlineSeg{replacement}, tail...)...)
 
-		// Deactivate all earlier link openers to prevent nested links.
 		if !op.image {
 			for k := 0; k < openIdx; k++ {
 				s2 := segs[k]
@@ -1475,17 +1838,13 @@ func renderSegments(segs []*inlineSeg) string {
 	return b.String()
 }
 
-// renderInline processes block-level text as inline markdown. It handles:
-//   - backslash escapes (\<punct> or \<newline>)
-//   - entity / numeric character references
-//   - hard line breaks
-//   - code spans
-//   - inline links `[text](url "title")` and images `![alt](url "title")`
-//   - emphasis and strong (`*` / `_` delimiter runs)
-// Reference-style links, autolinks, and raw HTML are not yet implemented.
-func renderInline(s string) string {
+// renderInline processes block-level text as inline markdown with optional
+// link reference map. Handles the full inline repertoire (escapes,
+// entities, hard breaks, code spans, inline and reference links/images,
+// autolinks, raw HTML, emphasis and strong).
+func renderInline(s string, refs LinkRefMap) string {
 	segs := tokenizeInline(s)
-	segs = processLinks(segs)
+	segs = processLinks(segs, refs)
 	segs = processEmphasis(segs)
 	return renderSegments(segs)
 }
@@ -1523,17 +1882,20 @@ func escapeHTMLString(s string) string {
 	return b.String()
 }
 
-// ToHTML concatenates per-block html fields, each followed by a newline.
-// Blocks that have no html field (parser was run without html:true) are
-// skipped.
+// ToHTML extracts link reference definitions from paragraph blocks, then
+// re-renders each surviving block against the resulting refs map and
+// concatenates the results so that reference-style links resolve.
+// Each block contributes its html followed by a newline.
 func ToHTML(blocks []any) string {
+	refs, cleaned := ExtractLinkRefsAndClean(blocks)
 	var b strings.Builder
-	for _, v := range blocks {
+	for _, v := range cleaned {
 		m, ok := v.(map[string]any)
 		if !ok {
 			continue
 		}
-		if h, ok := m["html"].(string); ok {
+		h := renderBlockHTML(m, refs)
+		if h != "" {
 			b.WriteString(h)
 			b.WriteByte('\n')
 		}

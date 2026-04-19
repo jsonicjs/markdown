@@ -554,15 +554,18 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
 
 // HTML rendering of a single block. Matches CommonMark-style output for the
 // block-level constructs this parser supports. Block text is routed through
-// renderInline so backslash escapes, entity references, and hard line breaks
-// are handled. Inline emphasis, links, code spans, and autolinks are not
-// yet implemented.
-function renderHtml(block: any): string {
+// renderInline so inline constructs (escapes, entities, code spans, links,
+// emphasis, autolinks, raw HTML) are handled. When a refs map is supplied,
+// reference-style links resolve through it.
+function renderHtml(block: any, refs: LinkRefMap = NO_REFS): string {
   switch (block.type) {
     case 'heading':
-      return `<h${block.level}>${renderInline(block.text)}</h${block.level}>`
+      return `<h${block.level}>${renderInline(
+        block.text,
+        refs,
+      )}</h${block.level}>`
     case 'paragraph':
-      return `<p>${renderInline(block.text)}</p>`
+      return `<p>${renderInline(block.text, refs)}</p>`
     case 'hr':
       return `<hr />`
     case 'code': {
@@ -579,16 +582,18 @@ function renderHtml(block: any): string {
     case 'list': {
       const tag = block.ordered ? 'ol' : 'ul'
       const items = block.items
-        .map((it: any) => `<li>${renderInline(it.text)}</li>`)
+        .map((it: any) => `<li>${renderInline(it.text, refs)}</li>`)
         .join('\n')
       return `<${tag}>\n${items}\n</${tag}>`
     }
     case 'blockquote':
       return (
         `<blockquote>\n<p>` +
-        renderInline(block.text) +
+        renderInline(block.text, refs) +
         `</p>\n</blockquote>`
       )
+    case 'html':
+      return block.text
   }
   return ''
 }
@@ -699,6 +704,9 @@ function decodeEntity(ref: string): string | null {
 // atoms (code span output, decoded entities, escape output, hard breaks);
 // delim segments are `*`/`_` runs that the emphasis pass may consume;
 // bracket segments are `[`, `![`, or `]` markers consumed by the link pass.
+// A closing bracket may carry either inline target info (url/title) or
+// reference info (refLabel filled = full, refCollapsed = collapsed `[]`,
+// refShortcut = bare `[text]`).
 type InlineSeg =
   | { kind: 'text'; value: string }
   | { kind: 'html'; value: string }
@@ -716,7 +724,17 @@ type InlineSeg =
       active: boolean
       url?: string
       title?: string
+      refLabel?: string
+      refCollapsed?: boolean
+      refShortcut?: boolean
     }
+
+// Link reference definition — produced by extracting `[label]: url "title"`
+// paragraphs from the parsed block list.
+type LinkRef = { url: string; title: string }
+type LinkRefMap = Record<string, LinkRef>
+
+const NO_REFS: LinkRefMap = {}
 
 // ASCII punctuation used for CommonMark flanking classification. The full
 // spec uses Unicode punctuation; this is a close ASCII approximation.
@@ -806,6 +824,230 @@ function parseLinkTarget(
 
   if (s[j] !== ')') return null
   return { url, title, end: j + 1 }
+}
+
+// parseReferenceLabel parses `[label]` or `[]` starting at position i in s
+// and returns { label, collapsed, end } on success, else null. Collapsed
+// references are bracket pairs containing only optional whitespace.
+function parseReferenceLabel(
+  s: string,
+  i: number,
+): { label: string; collapsed: boolean; end: number } | null {
+  if (s[i] !== '[') return null
+  let j = i + 1
+  let label = ''
+  while (j < s.length && s[j] !== ']') {
+    if (s[j] === '\\' && j + 1 < s.length) {
+      label += s[j] + s[j + 1]
+      j += 2
+      continue
+    }
+    if (s[j] === '[') return null
+    label += s[j]
+    j++
+  }
+  if (s[j] !== ']') return null
+  const collapsed = /^[ \t\r\n]*$/.test(label)
+  return { label, collapsed, end: j + 1 }
+}
+
+// normalizeLinkLabel applies the CommonMark label equality rule: strip
+// leading/trailing whitespace, collapse interior whitespace to single
+// spaces, case-fold via toLowerCase.
+function normalizeLinkLabel(s: string): string {
+  return s.trim().toLowerCase().replace(/[ \t\r\n]+/g, ' ')
+}
+
+// parseLinkRefDef attempts to match a `[label]: destination[ "title"]`
+// link reference definition at the start of text. Returns { label, url,
+// title, length } on success, or null.
+function parseLinkRefDef(
+  text: string,
+): { label: string; url: string; title: string; length: number } | null {
+  const lead = text.match(/^[ ]{0,3}/)!
+  let i = lead[0].length
+  if (text[i] !== '[') return null
+  i++
+  let label = ''
+  let labelEnd = -1
+  while (i < text.length) {
+    const c = text[i]
+    if (c === '\n') {
+      label += c
+      i++
+      if (label.split('\n').length > 2) return null
+      continue
+    }
+    if (c === ']') {
+      labelEnd = i
+      break
+    }
+    if (c === '\\' && i + 1 < text.length) {
+      label += text[i + 1]
+      i += 2
+      continue
+    }
+    if (c === '[') return null
+    label += c
+    i++
+  }
+  if (labelEnd < 0) return null
+  if (!/\S/.test(label)) return null
+  i = labelEnd + 1
+  if (text[i] !== ':') return null
+  i++
+  // Optional whitespace (at most one newline).
+  let nls = 0
+  while (i < text.length && /[ \t\r\n]/.test(text[i])) {
+    if (text[i] === '\n') {
+      nls++
+      if (nls > 1) return null
+    }
+    i++
+  }
+
+  // URL: angle-bracket or plain.
+  let url = ''
+  if (text[i] === '<') {
+    let k = i + 1
+    while (k < text.length && text[k] !== '>' && text[k] !== '\n' && text[k] !== '<') {
+      if (text[k] === '\\' && k + 1 < text.length) {
+        url += text[k + 1]
+        k += 2
+        continue
+      }
+      url += text[k]
+      k++
+    }
+    if (text[k] !== '>') return null
+    i = k + 1
+  } else {
+    while (i < text.length) {
+      const c = text[i]
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') break
+      if (c.charCodeAt(0) < 0x20 || c === '\x7f') break
+      if (c === '\\' && i + 1 < text.length) {
+        url += text[i + 1]
+        i += 2
+        continue
+      }
+      url += c
+      i++
+    }
+    if (url.length === 0) return null
+  }
+
+  // Optional title on same line, or on the next line after whitespace.
+  let titleEnd = i
+  let title = ''
+  let j = i
+  let titleNewlines = 0
+  // Save position in case we need to back out (title on following line
+  // requires whitespace including newline before the title).
+  while (j < text.length && /[ \t]/.test(text[j])) j++
+  let hadNewlineBeforeTitle = false
+  if (j < text.length && text[j] === '\n') {
+    j++
+    hadNewlineBeforeTitle = true
+    while (j < text.length && /[ \t]/.test(text[j])) j++
+  }
+  if (j < text.length && (text[j] === '"' || text[j] === "'" || text[j] === '(')) {
+    const openQ = text[j]
+    const closeQ = openQ === '(' ? ')' : openQ
+    let k = j + 1
+    let ok = false
+    const tbuf: string[] = []
+    while (k < text.length) {
+      const c = text[k]
+      if (c === '\\' && k + 1 < text.length) {
+        tbuf.push(text[k + 1])
+        k += 2
+        continue
+      }
+      if (c === closeQ) {
+        ok = true
+        break
+      }
+      if (c === '\n') {
+        titleNewlines++
+        if (titleNewlines > 1) break
+      }
+      if (openQ === '(' && c === '(') break
+      tbuf.push(c)
+      k++
+    }
+    if (ok) {
+      title = tbuf.join('')
+      j = k + 1
+      // The rest of this line must be only whitespace.
+      let m = j
+      while (m < text.length && text[m] !== '\n') {
+        if (!/[ \t]/.test(text[m])) {
+          // Title invalid in this position — revert.
+          title = ''
+          j = titleEnd
+          break
+        }
+        m++
+      }
+      if (title !== '') titleEnd = j
+    }
+    void hadNewlineBeforeTitle
+  }
+
+  // Ensure the definition ends at end of line (optionally whitespace).
+  let endPos = titleEnd
+  while (endPos < text.length && /[ \t]/.test(text[endPos])) endPos++
+  if (endPos < text.length) {
+    if (text[endPos] !== '\n') {
+      // If title was parsed but followed by non-newline garbage, and title
+      // was on the *same* line as the URL, the whole definition is invalid.
+      // If title was on the following line, we still accept with no title.
+      if (title !== '') {
+        title = ''
+        titleEnd = i
+        endPos = titleEnd
+        while (endPos < text.length && /[ \t]/.test(text[endPos])) endPos++
+        if (endPos < text.length && text[endPos] !== '\n') return null
+      } else {
+        return null
+      }
+    }
+  }
+  if (endPos < text.length && text[endPos] === '\n') endPos++
+
+  return { label, url, title, length: endPos }
+}
+
+// extractLinkRefsAndClean walks the block list, pulls `[label]: url "title"`
+// link reference definitions out of the leading portion of paragraph
+// blocks, returns the accumulated ref map, and filters blocks that have
+// been fully consumed by definitions.
+function extractLinkRefsAndClean(
+  blocks: MdBlock[],
+): { refs: LinkRefMap; blocks: MdBlock[] } {
+  const refs: LinkRefMap = {}
+  const out: MdBlock[] = []
+  for (const b of blocks) {
+    if (b.type !== 'paragraph') {
+      out.push(b)
+      continue
+    }
+    let text = b.text
+    while (true) {
+      const def = parseLinkRefDef(text)
+      if (!def) break
+      const norm = normalizeLinkLabel(def.label)
+      if (norm.length > 0 && !(norm in refs)) {
+        refs[norm] = { url: def.url, title: def.title }
+      }
+      text = text.slice(def.length)
+    }
+    if (text.length > 0) {
+      out.push({ ...b, text })
+    }
+  }
+  return { refs, blocks: out }
 }
 
 // encodeLinkUrl applies a minimal URL normalization to the destination URL:
@@ -1043,8 +1285,9 @@ function tokenizeInline(s: string): InlineSeg[] {
       continue
     }
 
-    // Link close `]` — if followed by `(url[ "title"])`, consume it and
-    // stash the parsed target on the bracket segment for the link pass.
+    // Link close `]` — if followed by `(url[ "title"])`, stash the inline
+    // target. Otherwise, if followed by `[label]` or `[]`, stash reference
+    // info. Otherwise mark as a shortcut reference (label = bracket text).
     if (c === ']') {
       const lt = parseLinkTarget(s, i + 1)
       if (lt) {
@@ -1057,15 +1300,29 @@ function tokenizeInline(s: string): InlineSeg[] {
           title: lt.title,
         })
         i = lt.end
-      } else {
+        continue
+      }
+      const rl = parseReferenceLabel(s, i + 1)
+      if (rl) {
         segs.push({
           kind: 'bracket',
           open: false,
           image: false,
           active: true,
+          refLabel: rl.collapsed ? undefined : rl.label,
+          refCollapsed: rl.collapsed,
         })
-        i++
+        i = rl.end
+        continue
       }
+      segs.push({
+        kind: 'bracket',
+        open: false,
+        image: false,
+        active: true,
+        refShortcut: true,
+      })
+      i++
       continue
     }
 
@@ -1125,16 +1382,16 @@ function tokenizeInline(s: string): InlineSeg[] {
 // (closer carries a parsed url), the enclosed segments are processed
 // recursively (emphasis + nested links) and the whole `[...]( )` span is
 // replaced by a single html segment wrapping the rendered inner text in an
-// `<a>` or `<img>` element.
-function processLinks(segs: InlineSeg[]): InlineSeg[] {
+// `<a>` or `<img>` element. For reference-style links (full, collapsed,
+// or shortcut), the label is resolved against the supplied refs map.
+function processLinks(
+  segs: InlineSeg[],
+  refs: LinkRefMap = NO_REFS,
+): InlineSeg[] {
   let i = 0
   while (i < segs.length) {
     const close = segs[i]
-    if (
-      close.kind !== 'bracket' ||
-      close.open ||
-      close.url === undefined
-    ) {
+    if (close.kind !== 'bracket' || close.open) {
       i++
       continue
     }
@@ -1151,31 +1408,63 @@ function processLinks(segs: InlineSeg[]): InlineSeg[] {
     }
 
     if (openIdx < 0) {
+      // Unmatched close bracket — deactivate and move on.
       i++
       continue
     }
 
     const open = segs[openIdx] as Extract<InlineSeg, { kind: 'bracket' }>
     const inner = segs.slice(openIdx + 1, i)
+
+    // Resolve the target: inline url, or lookup via refs.
+    let url: string | undefined
+    let title: string | undefined
+    if (close.url !== undefined) {
+      url = close.url
+      title = close.title
+    } else {
+      let label: string | undefined
+      if (close.refLabel) {
+        label = close.refLabel
+      } else if (close.refCollapsed || close.refShortcut) {
+        label = innerText(inner)
+      }
+      if (label !== undefined) {
+        const ref = refs[normalizeLinkLabel(label)]
+        if (ref) {
+          url = ref.url
+          title = ref.title
+        }
+      }
+    }
+
+    if (url === undefined) {
+      // No match. Deactivate the open bracket (for shortcut only) and
+      // continue past this close bracket.
+      open.active = false
+      i++
+      continue
+    }
+
     // Recursively process nested links then emphasis within link text.
-    const nested = processLinks(inner)
+    const nested = processLinks(inner, refs)
     processEmphasis(nested)
 
     let html: string
     if (open.image) {
       const alt = innerText(nested)
-      const titleAttr = close.title
-        ? ` title="${escapeHtmlString(close.title)}"`
+      const titleAttr = title
+        ? ` title="${escapeHtmlString(title)}"`
         : ''
-      html = `<img src="${encodeLinkUrl(close.url!)}" alt="${escapeHtmlString(
+      html = `<img src="${encodeLinkUrl(url)}" alt="${escapeHtmlString(
         alt,
       )}"${titleAttr} />`
     } else {
       const inside = renderSegments(nested)
-      const titleAttr = close.title
-        ? ` title="${escapeHtmlString(close.title)}"`
+      const titleAttr = title
+        ? ` title="${escapeHtmlString(title)}"`
         : ''
-      html = `<a href="${encodeLinkUrl(close.url!)}"${titleAttr}>${inside}</a>`
+      html = `<a href="${encodeLinkUrl(url)}"${titleAttr}>${inside}</a>`
     }
 
     segs.splice(openIdx, i - openIdx + 1, {
@@ -1291,12 +1580,13 @@ function renderSegments(segs: InlineSeg[]): string {
 //   - entity / numeric character references
 //   - hard line breaks (2+ trailing spaces before \n, or backslash before \n)
 //   - code spans (`...`)
-//   - inline links `[text](url "title")` and images `![alt](url "title")`
+//   - inline, reference, collapsed, and shortcut links + images
+//   - autolinks `<uri>` and `<email>`
+//   - raw HTML (open/close tags, comments, PI, CDATA, declarations)
 //   - emphasis and strong (`*` / `_` delimiter runs)
-// Reference-style links, autolinks, and raw HTML are not yet implemented.
-function renderInline(s: string): string {
+function renderInline(s: string, refs: LinkRefMap = NO_REFS): string {
   const segs = tokenizeInline(s)
-  processLinks(segs)
+  processLinks(segs, refs)
   processEmphasis(segs)
   return renderSegments(segs)
 }
@@ -1315,13 +1605,17 @@ function escapeHtmlString(s: string): string {
   return out
 }
 
-// Concatenate per-block html fields into a full document string. Each block
-// contributes its html followed by a trailing newline, matching the shape
-// CommonMark spec tests expect.
+// Concatenate per-block html into a full document string. First extracts
+// link reference definitions from paragraph blocks and re-renders each
+// remaining block against the resulting refs map so reference-style links
+// resolve. Each rendered block contributes its html followed by a newline,
+// matching the shape CommonMark spec tests expect.
 function toHtml(blocks: MdBlock[]): string {
+  const { refs, blocks: cleaned } = extractLinkRefsAndClean(blocks)
   let out = ''
-  for (const b of blocks) {
-    if (b.html !== undefined) out += b.html + '\n'
+  for (const b of cleaned) {
+    const h = renderHtml(b, refs)
+    if (h.length > 0) out += h + '\n'
   }
   return out
 }
