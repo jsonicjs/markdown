@@ -1121,7 +1121,7 @@ function parseLinkTarget(
       s[k] !== '\n'
     ) {
       if (s[k] === '\\' && k + 1 < s.length) {
-        url += s[k + 1]
+        url += s[k] + s[k + 1]
         k += 2
         continue
       }
@@ -1135,7 +1135,7 @@ function parseLinkTarget(
     while (j < s.length) {
       const c = s[j]
       if (c === '\\' && j + 1 < s.length) {
-        url += s[j + 1]
+        url += s[j] + s[j + 1]
         j += 2
         continue
       }
@@ -1163,7 +1163,7 @@ function parseLinkTarget(
     let k = j + 1
     while (k < s.length && s[k] !== closeQ) {
       if (s[k] === '\\' && k + 1 < s.length) {
-        title += s[k + 1]
+        title += s[k] + s[k + 1]
         k += 2
         continue
       }
@@ -1260,13 +1260,16 @@ function parseLinkRefDef(
     i++
   }
 
-  // URL: angle-bracket or plain.
+  // URL: angle-bracket or plain. Backslashes are kept verbatim in the
+  // stored URL — encodeLinkUrl will decode them at render time. The
+  // backslash still protects the next character from being treated as a
+  // delimiter during parsing.
   let url = ''
   if (text[i] === '<') {
     let k = i + 1
     while (k < text.length && text[k] !== '>' && text[k] !== '\n' && text[k] !== '<') {
       if (text[k] === '\\' && k + 1 < text.length) {
-        url += text[k + 1]
+        url += text[k] + text[k + 1]
         k += 2
         continue
       }
@@ -1281,7 +1284,7 @@ function parseLinkRefDef(
       if (c === ' ' || c === '\t' || c === '\n' || c === '\r') break
       if (c.charCodeAt(0) < 0x20 || c === '\x7f') break
       if (c === '\\' && i + 1 < text.length) {
-        url += text[i + 1]
+        url += text[i] + text[i + 1]
         i += 2
         continue
       }
@@ -1292,20 +1295,25 @@ function parseLinkRefDef(
   }
 
   // Optional title on same line, or on the next line after whitespace.
+  // We require AT LEAST one whitespace character between the URL and
+  // the title's opening quote; otherwise what looks like a title is
+  // actually part of the URL or invalid.
+  const urlEnd = i
   let titleEnd = i
   let title = ''
   let j = i
   let titleNewlines = 0
-  // Save position in case we need to back out (title on following line
-  // requires whitespace including newline before the title).
   while (j < text.length && /[ \t]/.test(text[j])) j++
-  let hadNewlineBeforeTitle = false
   if (j < text.length && text[j] === '\n') {
     j++
-    hadNewlineBeforeTitle = true
     while (j < text.length && /[ \t]/.test(text[j])) j++
   }
-  if (j < text.length && (text[j] === '"' || text[j] === "'" || text[j] === '(')) {
+  const hadWhitespaceAfterUrl = j > urlEnd
+  if (
+    hadWhitespaceAfterUrl &&
+    j < text.length &&
+    (text[j] === '"' || text[j] === "'" || text[j] === '(')
+  ) {
     const openQ = text[j]
     const closeQ = openQ === '(' ? ')' : openQ
     let k = j + 1
@@ -1314,7 +1322,7 @@ function parseLinkRefDef(
     while (k < text.length) {
       const c = text[k]
       if (c === '\\' && k + 1 < text.length) {
-        tbuf.push(text[k + 1])
+        tbuf.push(text[k] + text[k + 1])
         k += 2
         continue
       }
@@ -1346,7 +1354,6 @@ function parseLinkRefDef(
       }
       if (title !== '') titleEnd = j
     }
-    void hadNewlineBeforeTitle
   }
 
   // Ensure the definition ends at end of line (optionally whitespace).
@@ -2038,16 +2045,55 @@ function escapeHtmlString(s: string): string {
   return out
 }
 
-// Concatenate per-block html into a full document string. First extracts
-// link reference definitions from paragraph blocks and re-renders each
-// remaining block against the resulting refs map so reference-style links
-// resolve. Each rendered block contributes its html followed by a newline,
-// matching the shape CommonMark spec tests expect.
+// gatherAllLinkRefs walks the top-level blocks (and recursively through
+// blockquote content and list item content) and collects every link
+// reference definition it finds. Refs defined inside a blockquote or list
+// item are visible to the document as a whole.
+function gatherAllLinkRefs(blocks: MdBlock[]): LinkRefMap {
+  const refs: LinkRefMap = {}
+  const visit = (bs: MdBlock[]) => {
+    for (const b of bs) {
+      if (b.type === 'paragraph') {
+        let text = (b as any).text
+        while (true) {
+          const def = parseLinkRefDef(text)
+          if (!def) break
+          const norm = normalizeLinkLabel(def.label)
+          if (norm.length > 0 && !(norm in refs)) {
+            refs[norm] = { url: def.url, title: def.title }
+          }
+          text = text.slice(def.length)
+        }
+      } else if (b.type === 'blockquote') {
+        try {
+          visit(parseNested((b as any).text) as MdBlock[])
+        } catch {}
+      } else if (b.type === 'list') {
+        for (const item of (b as any).items) {
+          try {
+            visit(parseNested(item.text) as MdBlock[])
+          } catch {}
+        }
+      }
+    }
+  }
+  visit(blocks)
+  return refs
+}
+
+// Concatenate per-block html into a full document string. Gathers link
+// reference definitions from the full block tree (including blockquote
+// and list item content), then extracts top-level defs to drop
+// defs-only paragraphs, and renders each surviving block against the
+// merged ref map.
 function toHtml(blocks: MdBlock[]): string {
-  const { refs, blocks: cleaned } = extractLinkRefsAndClean(blocks)
+  const allRefs = gatherAllLinkRefs(blocks)
+  const { refs: topRefs, blocks: cleaned } = extractLinkRefsAndClean(blocks)
+  const merged: LinkRefMap = { ...allRefs }
+  for (const k of Object.keys(topRefs)) merged[k] = topRefs[k]
   let out = ''
   for (const b of cleaned) {
-    const h = renderHtml(b, refs)
+    const h = renderHtml(b, merged)
     if (h.length > 0) out += h + '\n'
   }
   return out

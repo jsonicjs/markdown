@@ -1270,6 +1270,7 @@ func parseLinkTarget(s string, i int) (string, string, int, bool) {
 		k := j + 1
 		for k < len(s) && s[k] != '>' && s[k] != '<' && s[k] != '\n' {
 			if s[k] == '\\' && k+1 < len(s) {
+				urlB.WriteByte(s[k])
 				urlB.WriteByte(s[k+1])
 				k += 2
 				continue
@@ -1286,6 +1287,7 @@ func parseLinkTarget(s string, i int) (string, string, int, bool) {
 		for j < len(s) {
 			c := s[j]
 			if c == '\\' && j+1 < len(s) {
+				urlB.WriteByte(s[j])
 				urlB.WriteByte(s[j+1])
 				j += 2
 				continue
@@ -1325,6 +1327,7 @@ func parseLinkTarget(s string, i int) (string, string, int, bool) {
 		k := j + 1
 		for k < len(s) && s[k] != closeQ {
 			if s[k] == '\\' && k+1 < len(s) {
+				titleB.WriteByte(s[k])
 				titleB.WriteByte(s[k+1])
 				k += 2
 				continue
@@ -1521,12 +1524,15 @@ func parseLinkRefDef(text string) (string, string, string, int, bool) {
 		}
 		break
 	}
-	// URL.
+	// URL: backslash-escapes are retained verbatim; encodeLinkUrl decodes
+	// them at render time, but the backslash still protects the following
+	// character from being treated as a delimiter.
 	var urlB strings.Builder
 	if i < len(text) && text[i] == '<' {
 		k := i + 1
 		for k < len(text) && text[k] != '>' && text[k] != '\n' && text[k] != '<' {
 			if text[k] == '\\' && k+1 < len(text) {
+				urlB.WriteByte(text[k])
 				urlB.WriteByte(text[k+1])
 				k += 2
 				continue
@@ -1548,6 +1554,7 @@ func parseLinkRefDef(text string) (string, string, string, int, bool) {
 				break
 			}
 			if c == '\\' && i+1 < len(text) {
+				urlB.WriteByte(text[i])
 				urlB.WriteByte(text[i+1])
 				i += 2
 				continue
@@ -1560,23 +1567,22 @@ func parseLinkRefDef(text string) (string, string, string, int, bool) {
 		}
 	}
 
-	// Optional title.
+	// Optional title. Requires whitespace between URL and opening quote.
 	title := ""
+	urlEndPos := i
 	titleEnd := i
 	j := i
 	for j < len(text) && (text[j] == ' ' || text[j] == '\t') {
 		j++
 	}
-	hadNewline := false
 	if j < len(text) && text[j] == '\n' {
 		j++
-		hadNewline = true
 		for j < len(text) && (text[j] == ' ' || text[j] == '\t') {
 			j++
 		}
 	}
-	_ = hadNewline
-	if j < len(text) && (text[j] == '"' || text[j] == '\'' || text[j] == '(') {
+	hadWhitespaceAfterURL := j > urlEndPos
+	if hadWhitespaceAfterURL && j < len(text) && (text[j] == '"' || text[j] == '\'' || text[j] == '(') {
 		openQ := text[j]
 		closeQ := openQ
 		if openQ == '(' {
@@ -1589,6 +1595,7 @@ func parseLinkRefDef(text string) (string, string, string, int, bool) {
 		for k < len(text) {
 			c := text[k]
 			if c == '\\' && k+1 < len(text) {
+				tb.WriteByte(text[k])
 				tb.WriteByte(text[k+1])
 				k += 2
 				continue
@@ -2330,19 +2337,72 @@ func escapeHTMLString(s string) string {
 	return b.String()
 }
 
-// ToHTML extracts link reference definitions from paragraph blocks, then
-// re-renders each surviving block against the resulting refs map and
-// concatenates the results so that reference-style links resolve.
-// Each block contributes its html followed by a newline.
+// GatherAllLinkRefs walks the top-level blocks (and recursively through
+// blockquote content and list item content) and collects every link
+// reference definition. Refs defined inside a blockquote or list item
+// are visible to the document as a whole.
+func GatherAllLinkRefs(blocks []any) LinkRefMap {
+	refs := LinkRefMap{}
+	var visit func(bs []any)
+	visit = func(bs []any) {
+		for _, v := range bs {
+			b, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch b["type"] {
+			case "paragraph":
+				text, _ := b["text"].(string)
+				for {
+					label, url, title, length, matched := parseLinkRefDef(text)
+					if !matched {
+						break
+					}
+					norm := normalizeLinkLabel(label)
+					if norm != "" {
+						if _, exists := refs[norm]; !exists {
+							refs[norm] = LinkRef{URL: url, Title: title}
+						}
+					}
+					text = text[length:]
+				}
+			case "blockquote":
+				text, _ := b["text"].(string)
+				visit(parseNested(text))
+			case "list":
+				items, _ := b["items"].([]any)
+				for _, it := range items {
+					m, _ := it.(map[string]any)
+					text, _ := m["text"].(string)
+					visit(parseNested(text))
+				}
+			}
+		}
+	}
+	visit(blocks)
+	return refs
+}
+
+// ToHTML gathers link reference definitions from the full block tree,
+// extracts top-level defs to drop defs-only paragraphs, and renders
+// each surviving block against the merged ref map.
 func ToHTML(blocks []any) string {
-	refs, cleaned := ExtractLinkRefsAndClean(blocks)
+	allRefs := GatherAllLinkRefs(blocks)
+	topRefs, cleaned := ExtractLinkRefsAndClean(blocks)
+	merged := LinkRefMap{}
+	for k, v := range allRefs {
+		merged[k] = v
+	}
+	for k, v := range topRefs {
+		merged[k] = v
+	}
 	var b strings.Builder
 	for _, v := range cleaned {
 		m, ok := v.(map[string]any)
 		if !ok {
 			continue
 		}
-		h := renderBlockHTML(m, refs)
+		h := renderBlockHTML(m, merged)
 		if h != "" {
 			b.WriteString(h)
 			b.WriteByte('\n')
