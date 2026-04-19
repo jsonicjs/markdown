@@ -96,6 +96,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 		codeFence = "```"
 	}
 	trim, _ := options["trim"].(bool)
+	emitHTML, _ := options["html"].(bool)
 
 	falseVal := false
 
@@ -145,11 +146,18 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				"level": v["level"],
 				"text":  v["text"],
 			}
+			if emitHTML {
+				block["html"] = RenderHTML(block)
+			}
 			pushBlock(r, block)
 		}),
 
 		"@hr": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
-			pushBlock(r, map[string]any{"type": "hr"})
+			block := map[string]any{"type": "hr"}
+			if emitHTML {
+				block["html"] = RenderHTML(block)
+			}
+			pushBlock(r, block)
 		}),
 
 		"@code": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -158,6 +166,9 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				"type": "code",
 				"lang": v["lang"],
 				"text": v["text"],
+			}
+			if emitHTML {
+				block["html"] = RenderHTML(block)
 			}
 			pushBlock(r, block)
 		}),
@@ -169,6 +180,9 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				"ordered": v["ordered"],
 				"items":   []any{map[string]any{"text": v["text"]}},
 			}
+			if emitHTML {
+				block["html"] = RenderHTML(block)
+			}
 			pushBlock(r, block)
 			ensureMeta(ctx)["mdCurrent"] = block
 		}),
@@ -178,11 +192,17 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
 			items, _ := cur["items"].([]any)
 			cur["items"] = append(items, map[string]any{"text": v["text"]})
+			if emitHTML {
+				cur["html"] = RenderHTML(cur)
+			}
 		}),
 
 		"@quote-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(string)
 			block := map[string]any{"type": "blockquote", "text": v}
+			if emitHTML {
+				block["html"] = RenderHTML(block)
+			}
 			pushBlock(r, block)
 			ensureMeta(ctx)["mdCurrent"] = block
 		}),
@@ -192,6 +212,9 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
 			text, _ := cur["text"].(string)
 			cur["text"] = text + "\n" + v
+			if emitHTML {
+				cur["html"] = RenderHTML(cur)
+			}
 		}),
 
 		"@para-start": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -200,6 +223,9 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				v = strings.TrimSpace(v)
 			}
 			block := map[string]any{"type": "paragraph", "text": v}
+			if emitHTML {
+				block["html"] = RenderHTML(block)
+			}
 			pushBlock(r, block)
 			ensureMeta(ctx)["mdCurrent"] = block
 		}),
@@ -212,6 +238,9 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
 			text, _ := cur["text"].(string)
 			cur["text"] = text + "\n" + v
+			if emitHTML {
+				cur["html"] = RenderHTML(cur)
+			}
 		}),
 	}
 
@@ -443,6 +472,96 @@ func tinFor(lex *jsonic.Lex, name string) jsonic.Tin {
 var Defaults = map[string]any{
 	"codeFence": "```",
 	"trim":      false,
+	"html":      false,
+}
+
+// RenderHTML produces a CommonMark-style HTML fragment for a single block.
+// Inline emphasis, links, code spans, entities, and hard breaks are NOT
+// implemented — this renders only the block-level constructs the grammar
+// recognizes. Called from grammar actions when the html option is set.
+func RenderHTML(block map[string]any) string {
+	switch block["type"] {
+	case "heading":
+		level, _ := block["level"].(int)
+		text, _ := block["text"].(string)
+		return fmt.Sprintf("<h%d>%s</h%d>", level, escapeHTML(text), level)
+
+	case "paragraph":
+		text, _ := block["text"].(string)
+		return "<p>" + escapeHTML(text) + "</p>"
+
+	case "hr":
+		return "<hr />"
+
+	case "code":
+		text, _ := block["text"].(string)
+		lang, _ := block["lang"].(string)
+		cls := ""
+		if lang != "" {
+			cls = ` class="language-` + escapeHTML(lang) + `"`
+		}
+		trailing := "\n"
+		if text == "" || strings.HasSuffix(text, "\n") {
+			trailing = ""
+		}
+		return "<pre><code" + cls + ">" + escapeHTML(text) + trailing + "</code></pre>"
+
+	case "list":
+		tag := "ul"
+		if ordered, _ := block["ordered"].(bool); ordered {
+			tag = "ol"
+		}
+		items, _ := block["items"].([]any)
+		var b strings.Builder
+		b.WriteString("<")
+		b.WriteString(tag)
+		b.WriteString(">\n")
+		for i, it := range items {
+			if i > 0 {
+				b.WriteByte('\n')
+			}
+			m, _ := it.(map[string]any)
+			text, _ := m["text"].(string)
+			b.WriteString("<li>")
+			b.WriteString(escapeHTML(text))
+			b.WriteString("</li>")
+		}
+		b.WriteString("\n</")
+		b.WriteString(tag)
+		b.WriteString(">")
+		return b.String()
+
+	case "blockquote":
+		text, _ := block["text"].(string)
+		return "<blockquote>\n<p>" + escapeHTML(text) + "</p>\n</blockquote>"
+	}
+	return ""
+}
+
+// ToHTML concatenates per-block html fields, each followed by a newline.
+// Blocks that have no html field (parser was run without html:true) are
+// skipped.
+func ToHTML(blocks []any) string {
+	var b strings.Builder
+	for _, v := range blocks {
+		m, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if h, ok := m["html"].(string); ok {
+			b.WriteString(h)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, `"`, "&quot;")
+	return s
 }
 
 // parseGrammarText parses grammar text and builds a GrammarSpec with Ref support.

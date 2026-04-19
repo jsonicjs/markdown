@@ -15,16 +15,22 @@ import {
 type MarkdownOptions = {
   codeFence: string
   trim: boolean
+  html: boolean
 }
 
 // The data structure produced by this plugin.
 type MdBlock =
-  | { type: 'heading'; level: number; text: string }
-  | { type: 'paragraph'; text: string }
-  | { type: 'code'; lang: string; text: string }
-  | { type: 'list'; ordered: boolean; items: { text: string }[] }
-  | { type: 'blockquote'; text: string }
-  | { type: 'hr' }
+  | { type: 'heading'; level: number; text: string; html?: string }
+  | { type: 'paragraph'; text: string; html?: string }
+  | { type: 'code'; lang: string; text: string; html?: string }
+  | {
+      type: 'list'
+      ordered: boolean
+      items: { text: string }[]
+      html?: string
+    }
+  | { type: 'blockquote'; text: string; html?: string }
+  | { type: 'hr'; html?: string }
 
 // --- BEGIN EMBEDDED markdown-grammar.jsonic ---
 const grammarText = `
@@ -118,6 +124,8 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     },
   })
 
+  const emitHtml = !!options.html
+
   // Named function references for declarative grammar definition.
   const refs: Record<string, Function> = {
 
@@ -133,25 +141,32 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
 
     '@heading': (r: Rule) => {
       const v = r.o0.val as { level: number; text: string }
-      r.node.push({ type: 'heading', level: v.level, text: v.text })
+      const block: any = { type: 'heading', level: v.level, text: v.text }
+      if (emitHtml) block.html = renderHtml(block)
+      r.node.push(block)
     },
 
     '@hr': (r: Rule) => {
-      r.node.push({ type: 'hr' })
+      const block: any = { type: 'hr' }
+      if (emitHtml) block.html = renderHtml(block)
+      r.node.push(block)
     },
 
     '@code': (r: Rule) => {
       const v = r.o0.val as { lang: string; text: string }
-      r.node.push({ type: 'code', lang: v.lang, text: v.text })
+      const block: any = { type: 'code', lang: v.lang, text: v.text }
+      if (emitHtml) block.html = renderHtml(block)
+      r.node.push(block)
     },
 
     '@list-start': (r: Rule, ctx: Context) => {
       const v = r.o0.val as { ordered: boolean; text: string }
-      const block = {
+      const block: any = {
         type: 'list',
         ordered: v.ordered,
         items: [{ text: v.text }],
       }
+      if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
       ctx.u.mdCurrent = block
     },
@@ -159,11 +174,13 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     '@list-append': (r: Rule, ctx: Context) => {
       const v = r.o0.val as { ordered: boolean; text: string }
       ctx.u.mdCurrent.items.push({ text: v.text })
+      if (emitHtml) ctx.u.mdCurrent.html = renderHtml(ctx.u.mdCurrent)
     },
 
     '@quote-start': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
-      const block = { type: 'blockquote', text: v }
+      const block: any = { type: 'blockquote', text: v }
+      if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
       ctx.u.mdCurrent = block
     },
@@ -171,14 +188,16 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     '@quote-append': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
       ctx.u.mdCurrent.text += '\n' + v
+      if (emitHtml) ctx.u.mdCurrent.html = renderHtml(ctx.u.mdCurrent)
     },
 
     '@para-start': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
-      const block = {
+      const block: any = {
         type: 'paragraph',
         text: options.trim ? v.trim() : v,
       }
+      if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
       ctx.u.mdCurrent = block
     },
@@ -186,6 +205,7 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     '@para-append': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
       ctx.u.mdCurrent.text += '\n' + (options.trim ? v.trim() : v)
+      if (emitHtml) ctx.u.mdCurrent.html = renderHtml(ctx.u.mdCurrent)
     },
   }
 
@@ -347,12 +367,72 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
 }
 
 
+// HTML rendering of a single block. Matches CommonMark-style output for the
+// block-level constructs this parser supports. Inline emphasis, links, code
+// spans, entity references, and similar are not implemented.
+function renderHtml(block: any): string {
+  switch (block.type) {
+    case 'heading':
+      return `<h${block.level}>${escapeHtml(block.text)}</h${block.level}>`
+    case 'paragraph':
+      return `<p>${escapeHtml(block.text)}</p>`
+    case 'hr':
+      return `<hr />`
+    case 'code': {
+      const cls = block.lang
+        ? ` class="language-${escapeHtml(block.lang)}"`
+        : ''
+      return (
+        `<pre><code${cls}>` +
+        escapeHtml(block.text) +
+        (block.text.length === 0 || block.text.endsWith('\n') ? '' : '\n') +
+        `</code></pre>`
+      )
+    }
+    case 'list': {
+      const tag = block.ordered ? 'ol' : 'ul'
+      const items = block.items
+        .map((it: any) => `<li>${escapeHtml(it.text)}</li>`)
+        .join('\n')
+      return `<${tag}>\n${items}\n</${tag}>`
+    }
+    case 'blockquote':
+      return (
+        `<blockquote>\n<p>` +
+        escapeHtml(block.text) +
+        `</p>\n</blockquote>`
+      )
+  }
+  return ''
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+// Concatenate per-block html fields into a full document string. Each block
+// contributes its html followed by a trailing newline, matching the shape
+// CommonMark spec tests expect.
+function toHtml(blocks: MdBlock[]): string {
+  let out = ''
+  for (const b of blocks) {
+    if (b.html !== undefined) out += b.html + '\n'
+  }
+  return out
+}
+
+
 // Default option values.
 Markdown.defaults = {
   codeFence: '```',
   trim: false,
+  html: false,
 } as MarkdownOptions
 
-export { Markdown, buildMarkdownLineMatcher }
+export { Markdown, buildMarkdownLineMatcher, renderHtml, toHtml }
 
 export type { MarkdownOptions, MdBlock }

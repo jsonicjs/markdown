@@ -34,6 +34,8 @@ jobs:
         run: node --enable-source-maps --test dist-test/csv.test.js
       - name: Test markdown
         run: node --enable-source-maps --test dist-test/markdown.test.js
+      - name: Test markdown CommonMark spec
+        run: node --enable-source-maps --test dist-test/markdown-commonmark.test.js
 
   build-go:
     name: Go (csv + markdown)
