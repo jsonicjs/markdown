@@ -530,7 +530,10 @@ var (
 	reHTMLBlockT4Close = regexp.MustCompile(`>`)
 	reHTMLBlockT5Open  = regexp.MustCompile(`^ {0,3}<!\[CDATA\[`)
 	reHTMLBlockT5Close = regexp.MustCompile(`\]\]>`)
-	reHTMLBlockT7Open  = regexp.MustCompile(
+	reHTMLBlockT6Open  = regexp.MustCompile(
+		`(?i)^ {0,3}</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|/?>|$)`,
+	)
+	reHTMLBlockT7Open = regexp.MustCompile(
 		`^ {0,3}(?:<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:\s*=\s*(?:[^\s"'=<>` + "`" + `]+|'[^']*'|"[^"]*"))?)*\s*/?>|</[a-zA-Z][a-zA-Z0-9-]*\s*>)[ \t]*$`,
 	)
 )
@@ -644,10 +647,10 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				reHTMLBlockT3Open.MatchString(lineContent) ||
 				reHTMLBlockT5Open.MatchString(lineContent) ||
 				reHTMLBlockT4Open.MatchString(lineContent) ||
+				reHTMLBlockT6Open.MatchString(lineContent) ||
 				(state.last != "text" && reHTMLBlockT7Open.MatchString(lineContent)):
 
 				var closeRe *regexp.Regexp
-				terminateOnBlank := false
 				switch {
 				case reHTMLBlockT1Open.MatchString(lineContent):
 					closeRe = reHTMLBlockT1Close
@@ -659,9 +662,8 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 					closeRe = reHTMLBlockT5Close
 				case reHTMLBlockT4Open.MatchString(lineContent):
 					closeRe = reHTMLBlockT4Close
-				default:
-					terminateOnBlank = true
 				}
+				// Types 6 and 7 have closeRe == nil; terminate on blank.
 
 				htmlLines := []string{}
 				htmlEnd := sI
@@ -679,7 +681,7 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 						nextEnd = le + 1
 					}
 
-					if terminateOnBlank && strings.TrimLeft(innerLine, " \t") == "" {
+					if closeRe == nil && strings.TrimLeft(innerLine, " \t") == "" {
 						break
 					}
 					htmlLines = append(htmlLines, innerLine)

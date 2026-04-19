@@ -351,10 +351,9 @@ function expandLeadingTabs(s: string): string {
 }
 
 // HTML block recognition tables (CommonMark § 4.6). We implement types 1-5
-// (distinct end markers) and type 7 (any well-formed tag on a line by
-// itself, terminated by a blank line). Type 6 (the long list of
-// block-level tag names) is folded into the type-7 fallthrough for
-// simplicity.
+// (distinct end markers), type 6 (block-level tag names, terminated by a
+// blank line), and type 7 (any well-formed tag on a line by itself,
+// terminated by a blank line).
 const HTML_BLOCK_T1_OPEN =
   /^ {0,3}<(?:script|pre|style|textarea)(?:[\s>]|$)/i
 const HTML_BLOCK_T1_CLOSE = /<\/(?:script|pre|style|textarea)>/i
@@ -366,6 +365,10 @@ const HTML_BLOCK_T4_OPEN = /^ {0,3}<![A-Za-z]/
 const HTML_BLOCK_T4_CLOSE = />/
 const HTML_BLOCK_T5_OPEN = /^ {0,3}<!\[CDATA\[/
 const HTML_BLOCK_T5_CLOSE = /\]\]>/
+// Type 6: specific block-level tag names. The tag may be followed by any
+// content on the same line; the block terminates on a blank line.
+const HTML_BLOCK_T6_OPEN =
+  /^ {0,3}<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:\s|\/?>|$)/i
 // Type 7: any open or close tag on a line by itself (no trailing content).
 const HTML_BLOCK_T7_OPEN =
   /^ {0,3}(?:<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>|<\/[a-zA-Z][a-zA-Z0-9-]*\s*>)[ \t]*$/
@@ -425,13 +428,14 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       }
 
       // HTML block: consume contiguous lines through the type's end marker
-      // (types 1-5) or through the next blank line (type 7).
+      // (types 1-5) or through the next blank line (types 6 and 7).
       else if (
         HTML_BLOCK_T1_OPEN.test(lineContent) ||
         HTML_BLOCK_T2_OPEN.test(lineContent) ||
         HTML_BLOCK_T3_OPEN.test(lineContent) ||
         HTML_BLOCK_T5_OPEN.test(lineContent) ||
         HTML_BLOCK_T4_OPEN.test(lineContent) ||
+        HTML_BLOCK_T6_OPEN.test(lineContent) ||
         (state.last !== 'text' && HTML_BLOCK_T7_OPEN.test(lineContent))
       ) {
         const type1 = HTML_BLOCK_T1_OPEN.test(lineContent)
@@ -442,16 +446,12 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
           !type1 && !type2 && !type3 && !type5 && HTML_BLOCK_T4_OPEN.test(lineContent)
 
         let closeRe: RegExp | null
-        let terminateOnBlank = false
         if (type1) closeRe = HTML_BLOCK_T1_CLOSE
         else if (type2) closeRe = HTML_BLOCK_T2_CLOSE
         else if (type3) closeRe = HTML_BLOCK_T3_CLOSE
         else if (type4) closeRe = HTML_BLOCK_T4_CLOSE
         else if (type5) closeRe = HTML_BLOCK_T5_CLOSE
-        else {
-          closeRe = null
-          terminateOnBlank = true
-        }
+        else closeRe = null // types 6 and 7 terminate on blank line
 
         const htmlLines: string[] = []
         let htmlEnd = sI
@@ -463,7 +463,7 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
           if (innerLine.endsWith('\r')) innerLine = innerLine.slice(0, -1)
           const nextEnd = le < srclen ? le + 1 : le
 
-          if (terminateOnBlank && /^[ \t]*$/.test(innerLine)) {
+          if (!closeRe && /^[ \t]*$/.test(innerLine)) {
             done = true
             // Blank line is NOT included in the block.
             break
