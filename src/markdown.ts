@@ -31,6 +31,7 @@ type MdBlock =
     }
   | { type: 'blockquote'; text: string; html?: string }
   | { type: 'hr'; html?: string }
+  | { type: 'html'; text: string; html?: string }
 
 // --- BEGIN EMBEDDED markdown-grammar.jsonic ---
 const grammarText = `
@@ -76,6 +77,7 @@ const grammarText = `
     { s: '#MH'  a: '@heading'    g: 'md,heading' }
     { s: '#MR'  a: '@hr'         g: 'md,hr' }
     { s: '#MC'  a: '@code'       g: 'md,code' }
+    { s: '#MHB' a: '@htmlblock'  g: 'md,htmlblock' }
     { s: '#MIC' a: '@icode-start' p: icode-tail g: 'md,icode' }
     { s: '#ML'  a: '@list-start'  p: list-tail  g: 'md,list' }
     { s: '#MQ'  a: '@quote-start' p: quote-tail g: 'md,quote' }
@@ -164,6 +166,13 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       const v = r.o0.val as { lang: string; text: string }
       const block: any = { type: 'code', lang: v.lang, text: v.text }
       if (emitHtml) block.html = renderHtml(block)
+      r.node.push(block)
+    },
+
+    '@htmlblock': (r: Rule) => {
+      const v = r.o0.val as string
+      const block: any = { type: 'html', text: v }
+      if (emitHtml) block.html = v
       r.node.push(block)
     },
 
@@ -266,6 +275,26 @@ function stripIndent(s: string): string {
   return s.slice(i)
 }
 
+// HTML block recognition tables (CommonMark § 4.6). We implement types 1-5
+// (distinct end markers) and type 7 (any well-formed tag on a line by
+// itself, terminated by a blank line). Type 6 (the long list of
+// block-level tag names) is folded into the type-7 fallthrough for
+// simplicity.
+const HTML_BLOCK_T1_OPEN =
+  /^ {0,3}<(?:script|pre|style|textarea)(?:[\s>]|$)/i
+const HTML_BLOCK_T1_CLOSE = /<\/(?:script|pre|style|textarea)>/i
+const HTML_BLOCK_T2_OPEN = /^ {0,3}<!--/
+const HTML_BLOCK_T2_CLOSE = /-->/
+const HTML_BLOCK_T3_OPEN = /^ {0,3}<\?/
+const HTML_BLOCK_T3_CLOSE = /\?>/
+const HTML_BLOCK_T4_OPEN = /^ {0,3}<![A-Za-z]/
+const HTML_BLOCK_T4_CLOSE = />/
+const HTML_BLOCK_T5_OPEN = /^ {0,3}<!\[CDATA\[/
+const HTML_BLOCK_T5_CLOSE = /\]\]>/
+// Type 7: any open or close tag on a line by itself (no trailing content).
+const HTML_BLOCK_T7_OPEN =
+  /^ {0,3}(?:<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>|<\/[a-zA-Z][a-zA-Z0-9-]*\s*>)[ \t]*$/
+
 // Build the line-level lexer matcher. It scans one markdown line at a time
 // (including the trailing newline) and emits a token classified by block kind.
 // For fenced code blocks, it also consumes content lines through to the closing
@@ -315,6 +344,65 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token('#MB', null, srcPart, pnt)
         kind = 'blank'
+      }
+
+      // HTML block: consume contiguous lines through the type's end marker
+      // (types 1-5) or through the next blank line (type 7).
+      else if (
+        HTML_BLOCK_T1_OPEN.test(lineContent) ||
+        HTML_BLOCK_T2_OPEN.test(lineContent) ||
+        HTML_BLOCK_T3_OPEN.test(lineContent) ||
+        HTML_BLOCK_T5_OPEN.test(lineContent) ||
+        HTML_BLOCK_T4_OPEN.test(lineContent) ||
+        (state.last !== 'text' && HTML_BLOCK_T7_OPEN.test(lineContent))
+      ) {
+        const type1 = HTML_BLOCK_T1_OPEN.test(lineContent)
+        const type2 = HTML_BLOCK_T2_OPEN.test(lineContent)
+        const type3 = HTML_BLOCK_T3_OPEN.test(lineContent)
+        const type5 = HTML_BLOCK_T5_OPEN.test(lineContent)
+        const type4 =
+          !type1 && !type2 && !type3 && !type5 && HTML_BLOCK_T4_OPEN.test(lineContent)
+
+        let closeRe: RegExp | null
+        let terminateOnBlank = false
+        if (type1) closeRe = HTML_BLOCK_T1_CLOSE
+        else if (type2) closeRe = HTML_BLOCK_T2_CLOSE
+        else if (type3) closeRe = HTML_BLOCK_T3_CLOSE
+        else if (type4) closeRe = HTML_BLOCK_T4_CLOSE
+        else if (type5) closeRe = HTML_BLOCK_T5_CLOSE
+        else {
+          closeRe = null
+          terminateOnBlank = true
+        }
+
+        const htmlLines: string[] = []
+        let htmlEnd = sI
+        let done = false
+        while (htmlEnd < srclen && !done) {
+          let le = htmlEnd
+          while (le < srclen && src[le] !== '\n') le++
+          let innerLine = src.substring(htmlEnd, le)
+          if (innerLine.endsWith('\r')) innerLine = innerLine.slice(0, -1)
+          const nextEnd = le < srclen ? le + 1 : le
+
+          if (terminateOnBlank && /^[ \t]*$/.test(innerLine)) {
+            done = true
+            // Blank line is NOT included in the block.
+            break
+          }
+          htmlLines.push(innerLine)
+          htmlEnd = nextEnd
+          if (closeRe && closeRe.test(innerLine)) {
+            done = true
+            break
+          }
+        }
+
+        const htmlText = htmlLines.join('\n')
+        consumeEnd = htmlEnd
+        srcPart = src.substring(sI, consumeEnd)
+        tkn = lex.token('#MHB', htmlText, srcPart, pnt)
+        kind = 'htmlblock'
       }
 
       // Fenced code block start.

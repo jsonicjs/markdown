@@ -40,6 +40,7 @@
     { s: '#MH'  a: '@heading'    g: 'md,heading' }
     { s: '#MR'  a: '@hr'         g: 'md,hr' }
     { s: '#MC'  a: '@code'       g: 'md,code' }
+    { s: '#MHB' a: '@htmlblock'  g: 'md,htmlblock' }
     { s: '#MIC' a: '@icode-start' p: icode-tail g: 'md,icode' }
     { s: '#ML'  a: '@list-start'  p: list-tail  g: 'md,list' }
     { s: '#MQ'  a: '@quote-start' p: quote-tail g: 'md,quote' }

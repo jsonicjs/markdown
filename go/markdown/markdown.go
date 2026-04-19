@@ -59,6 +59,7 @@ const grammarText = `
     { s: '#MH'  a: '@heading'    g: 'md,heading' }
     { s: '#MR'  a: '@hr'         g: 'md,hr' }
     { s: '#MC'  a: '@code'       g: 'md,code' }
+    { s: '#MHB' a: '@htmlblock'  g: 'md,htmlblock' }
     { s: '#MIC' a: '@icode-start' p: icode-tail g: 'md,icode' }
     { s: '#ML'  a: '@list-start'  p: list-tail  g: 'md,list' }
     { s: '#MQ'  a: '@quote-start' p: quote-tail g: 'md,quote' }
@@ -140,6 +141,7 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 	j.Token("#MB")
 	j.Token("#MSX")
 	j.Token("#MIC")
+	j.Token("#MHB")
 
 	// Named function references for declarative grammar definition.
 	refs := map[jsonic.FuncRef]any{
@@ -179,6 +181,15 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 			}
 			if emitHTML {
 				block["html"] = RenderHTML(block)
+			}
+			pushBlock(r, block)
+		}),
+
+		"@htmlblock": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			v, _ := r.O0.Val.(string)
+			block := map[string]any{"type": "html", "text": v}
+			if emitHTML {
+				block["html"] = v
 			}
 			pushBlock(r, block)
 		}),
@@ -349,6 +360,25 @@ func stripIndent(s string) string {
 	return s[i:]
 }
 
+// HTML block recognition (CommonMark § 4.6). Types 1-5 have distinct end
+// markers; type 7 is any well-formed open or close tag on a line by
+// itself, terminated by a blank line.
+var (
+	reHTMLBlockT1Open  = regexp.MustCompile(`(?i)^ {0,3}<(?:script|pre|style|textarea)(?:[\s>]|$)`)
+	reHTMLBlockT1Close = regexp.MustCompile(`(?i)</(?:script|pre|style|textarea)>`)
+	reHTMLBlockT2Open  = regexp.MustCompile(`^ {0,3}<!--`)
+	reHTMLBlockT2Close = regexp.MustCompile(`-->`)
+	reHTMLBlockT3Open  = regexp.MustCompile(`^ {0,3}<\?`)
+	reHTMLBlockT3Close = regexp.MustCompile(`\?>`)
+	reHTMLBlockT4Open  = regexp.MustCompile(`^ {0,3}<![A-Za-z]`)
+	reHTMLBlockT4Close = regexp.MustCompile(`>`)
+	reHTMLBlockT5Open  = regexp.MustCompile(`^ {0,3}<!\[CDATA\[`)
+	reHTMLBlockT5Close = regexp.MustCompile(`\]\]>`)
+	reHTMLBlockT7Open  = regexp.MustCompile(
+		`^ {0,3}(?:<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:\s*=\s*(?:[^\s"'=<>` + "`" + `]+|'[^']*'|"[^"]*"))?)*\s*/?>|</[a-zA-Z][a-zA-Z0-9-]*\s*>)[ \t]*$`,
+	)
+)
+
 // isHorizontalRule reports whether s is a markdown horizontal rule line:
 // at most 3 leading spaces/tabs, then 3+ of the same `-`, `*`, or `_`
 // character (with optional spaces/tabs between), and only spaces/tabs after.
@@ -439,6 +469,65 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#MB", tinFor(lex, "#MB"), nil, srcPart)
 				kind = "blank"
+
+			// HTML block: consume contiguous lines through the type's
+			// end marker (types 1-5) or through the next blank line
+			// (type 7).
+			case reHTMLBlockT1Open.MatchString(lineContent) ||
+				reHTMLBlockT2Open.MatchString(lineContent) ||
+				reHTMLBlockT3Open.MatchString(lineContent) ||
+				reHTMLBlockT5Open.MatchString(lineContent) ||
+				reHTMLBlockT4Open.MatchString(lineContent) ||
+				(state.last != "text" && reHTMLBlockT7Open.MatchString(lineContent)):
+
+				var closeRe *regexp.Regexp
+				terminateOnBlank := false
+				switch {
+				case reHTMLBlockT1Open.MatchString(lineContent):
+					closeRe = reHTMLBlockT1Close
+				case reHTMLBlockT2Open.MatchString(lineContent):
+					closeRe = reHTMLBlockT2Close
+				case reHTMLBlockT3Open.MatchString(lineContent):
+					closeRe = reHTMLBlockT3Close
+				case reHTMLBlockT5Open.MatchString(lineContent):
+					closeRe = reHTMLBlockT5Close
+				case reHTMLBlockT4Open.MatchString(lineContent):
+					closeRe = reHTMLBlockT4Close
+				default:
+					terminateOnBlank = true
+				}
+
+				htmlLines := []string{}
+				htmlEnd := sI
+				for htmlEnd < srclen {
+					le := htmlEnd
+					for le < srclen && src[le] != '\n' {
+						le++
+					}
+					innerLine := src[htmlEnd:le]
+					if strings.HasSuffix(innerLine, "\r") {
+						innerLine = innerLine[:len(innerLine)-1]
+					}
+					nextEnd := le
+					if le < srclen {
+						nextEnd = le + 1
+					}
+
+					if terminateOnBlank && strings.TrimLeft(innerLine, " \t") == "" {
+						break
+					}
+					htmlLines = append(htmlLines, innerLine)
+					htmlEnd = nextEnd
+					if closeRe != nil && closeRe.MatchString(innerLine) {
+						break
+					}
+				}
+
+				htmlText := strings.Join(htmlLines, "\n")
+				consumeEnd = htmlEnd
+				srcPart := src[sI:consumeEnd]
+				tkn = lex.Token("#MHB", tinFor(lex, "#MHB"), htmlText, srcPart)
+				kind = "htmlblock"
 
 			// Fenced code block.
 			case strings.HasPrefix(stripIndent(lineContent), fence):
