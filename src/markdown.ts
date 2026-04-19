@@ -465,14 +465,16 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
 
 
 // HTML rendering of a single block. Matches CommonMark-style output for the
-// block-level constructs this parser supports. Inline emphasis, links, code
-// spans, entity references, and similar are not implemented.
+// block-level constructs this parser supports. Block text is routed through
+// renderInline so backslash escapes, entity references, and hard line breaks
+// are handled. Inline emphasis, links, code spans, and autolinks are not
+// yet implemented.
 function renderHtml(block: any): string {
   switch (block.type) {
     case 'heading':
-      return `<h${block.level}>${escapeHtml(block.text)}</h${block.level}>`
+      return `<h${block.level}>${renderInline(block.text)}</h${block.level}>`
     case 'paragraph':
-      return `<p>${escapeHtml(block.text)}</p>`
+      return `<p>${renderInline(block.text)}</p>`
     case 'hr':
       return `<hr />`
     case 'code': {
@@ -489,26 +491,201 @@ function renderHtml(block: any): string {
     case 'list': {
       const tag = block.ordered ? 'ol' : 'ul'
       const items = block.items
-        .map((it: any) => `<li>${escapeHtml(it.text)}</li>`)
+        .map((it: any) => `<li>${renderInline(it.text)}</li>`)
         .join('\n')
       return `<${tag}>\n${items}\n</${tag}>`
     }
     case 'blockquote':
       return (
         `<blockquote>\n<p>` +
-        escapeHtml(block.text) +
+        renderInline(block.text) +
         `</p>\n</blockquote>`
       )
   }
   return ''
 }
 
+// escapeHtml performs minimal HTML escaping: `& < > "`. Used for code content
+// where no inline markdown processing is applied.
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
+}
+
+// ASCII punctuation set recognized as a backslash escape target per
+// CommonMark (§ 6.1). Matches !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~.
+const BACKSLASH_ESCAPABLE =
+  '!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'
+
+// Named HTML entities recognized by the inline parser. This is a small
+// common subset rather than the full HTML5 named entity table; numeric
+// references (&#dec; and &#xhex;) are always decoded.
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  nbsp: '\u00A0',
+  copy: '\u00A9',
+  reg: '\u00AE',
+  trade: '\u2122',
+  hellip: '\u2026',
+  mdash: '\u2014',
+  ndash: '\u2013',
+  lsquo: '\u2018',
+  rsquo: '\u2019',
+  ldquo: '\u201C',
+  rdquo: '\u201D',
+  laquo: '\u00AB',
+  raquo: '\u00BB',
+  para: '\u00B6',
+  sect: '\u00A7',
+  middot: '\u00B7',
+  bull: '\u2022',
+  deg: '\u00B0',
+  plusmn: '\u00B1',
+  times: '\u00D7',
+  divide: '\u00F7',
+  pound: '\u00A3',
+  euro: '\u20AC',
+  yen: '\u00A5',
+  cent: '\u00A2',
+  Auml: '\u00C4',
+  Ouml: '\u00D6',
+  Uuml: '\u00DC',
+  auml: '\u00E4',
+  ouml: '\u00F6',
+  uuml: '\u00FC',
+  szlig: '\u00DF',
+  agrave: '\u00E0',
+  eacute: '\u00E9',
+  egrave: '\u00E8',
+  aring: '\u00E5',
+  oslash: '\u00F8',
+  AElig: '\u00C6',
+  aelig: '\u00E6',
+  frac12: '\u00BD',
+  frac14: '\u00BC',
+  frac34: '\u00BE',
+  iexcl: '\u00A1',
+  iquest: '\u00BF',
+}
+
+// decodeEntity returns the Unicode string for a full entity reference
+// (including the leading `&` and trailing `;`), or null if the reference is
+// not recognized. Numeric references are always decoded; invalid or
+// zero-code-point references map to the Unicode replacement character.
+function decodeEntity(ref: string): string | null {
+  if (ref.length < 3 || ref[0] !== '&' || ref[ref.length - 1] !== ';') {
+    return null
+  }
+  const body = ref.slice(1, -1)
+  if (body.startsWith('#x') || body.startsWith('#X')) {
+    const n = parseInt(body.slice(2), 16)
+    if (!Number.isFinite(n) || n === 0 || n > 0x10ffff) return '\uFFFD'
+    try {
+      return String.fromCodePoint(n)
+    } catch {
+      return '\uFFFD'
+    }
+  }
+  if (body.startsWith('#')) {
+    const n = parseInt(body.slice(1), 10)
+    if (!Number.isFinite(n) || n === 0 || n > 0x10ffff) return '\uFFFD'
+    try {
+      return String.fromCodePoint(n)
+    } catch {
+      return '\uFFFD'
+    }
+  }
+  const named = NAMED_ENTITIES[body]
+  return named === undefined ? null : named
+}
+
+// renderInline processes block-level text as inline markdown, currently
+// handling backslash escapes, entity/numeric references, and hard line
+// breaks (two+ trailing spaces before a newline, or backslash before a
+// newline). All other characters are HTML-escaped as needed.
+function renderInline(s: string): string {
+  let out = ''
+  let i = 0
+  const n = s.length
+
+  while (i < n) {
+    const c = s[i]
+
+    // Backslash escape or hard line break via backslash.
+    if (c === '\\' && i + 1 < n) {
+      const next = s[i + 1]
+      if (next === '\n') {
+        out += '<br />\n'
+        i += 2
+        continue
+      }
+      if (BACKSLASH_ESCAPABLE.indexOf(next) >= 0) {
+        out += escapeHtmlChar(next)
+        i += 2
+        continue
+      }
+    }
+
+    // Entity or numeric character reference.
+    if (c === '&') {
+      const m = s
+        .slice(i)
+        .match(
+          /^&(#[xX][0-9a-fA-F]{1,6};|#[0-9]{1,7};|[a-zA-Z][a-zA-Z0-9]{1,31};)/,
+        )
+      if (m) {
+        const decoded = decodeEntity('&' + m[1])
+        if (decoded !== null) {
+          out += escapeHtmlString(decoded)
+          i += m[0].length
+          continue
+        }
+      }
+    }
+
+    // Hard line break via 2+ trailing spaces.
+    if (c === '\n') {
+      // Look back for trailing spaces.
+      let trailing = 0
+      while (trailing < out.length && out[out.length - 1 - trailing] === ' ') {
+        trailing++
+      }
+      if (trailing >= 2) {
+        out = out.slice(0, out.length - trailing) + '<br />\n'
+        i++
+        continue
+      }
+      out += '\n'
+      i++
+      continue
+    }
+
+    out += escapeHtmlChar(c)
+    i++
+  }
+
+  return out
+}
+
+function escapeHtmlChar(c: string): string {
+  if (c === '&') return '&amp;'
+  if (c === '<') return '&lt;'
+  if (c === '>') return '&gt;'
+  if (c === '"') return '&quot;'
+  return c
+}
+
+function escapeHtmlString(s: string): string {
+  let out = ''
+  for (const c of s) out += escapeHtmlChar(c)
+  return out
 }
 
 // Concatenate per-block html fields into a full document string. Each block

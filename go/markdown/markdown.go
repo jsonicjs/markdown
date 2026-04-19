@@ -594,19 +594,19 @@ var Defaults = map[string]any{
 }
 
 // RenderHTML produces a CommonMark-style HTML fragment for a single block.
-// Inline emphasis, links, code spans, entities, and hard breaks are NOT
-// implemented — this renders only the block-level constructs the grammar
-// recognizes. Called from grammar actions when the html option is set.
+// Block text is routed through renderInline so backslash escapes, entity
+// references, and hard line breaks are handled. Inline emphasis, links,
+// code spans, and autolinks are not yet implemented.
 func RenderHTML(block map[string]any) string {
 	switch block["type"] {
 	case "heading":
 		level, _ := block["level"].(int)
 		text, _ := block["text"].(string)
-		return fmt.Sprintf("<h%d>%s</h%d>", level, escapeHTML(text), level)
+		return fmt.Sprintf("<h%d>%s</h%d>", level, renderInline(text), level)
 
 	case "paragraph":
 		text, _ := block["text"].(string)
-		return "<p>" + escapeHTML(text) + "</p>"
+		return "<p>" + renderInline(text) + "</p>"
 
 	case "hr":
 		return "<hr />"
@@ -641,7 +641,7 @@ func RenderHTML(block map[string]any) string {
 			m, _ := it.(map[string]any)
 			text, _ := m["text"].(string)
 			b.WriteString("<li>")
-			b.WriteString(escapeHTML(text))
+			b.WriteString(renderInline(text))
 			b.WriteString("</li>")
 		}
 		b.WriteString("\n</")
@@ -651,9 +651,166 @@ func RenderHTML(block map[string]any) string {
 
 	case "blockquote":
 		text, _ := block["text"].(string)
-		return "<blockquote>\n<p>" + escapeHTML(text) + "</p>\n</blockquote>"
+		return "<blockquote>\n<p>" + renderInline(text) + "</p>\n</blockquote>"
 	}
 	return ""
+}
+
+// ASCII punctuation set recognized as a backslash escape target per
+// CommonMark (§ 6.1).
+const backslashEscapable = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+// Named HTML entities recognized by the inline parser. A small common
+// subset rather than the full HTML5 named entity table; numeric references
+// are always decoded by decodeEntity.
+var namedEntities = map[string]string{
+	"amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'",
+	"nbsp": "\u00A0", "copy": "\u00A9", "reg": "\u00AE", "trade": "\u2122",
+	"hellip": "\u2026", "mdash": "\u2014", "ndash": "\u2013",
+	"lsquo": "\u2018", "rsquo": "\u2019", "ldquo": "\u201C", "rdquo": "\u201D",
+	"laquo": "\u00AB", "raquo": "\u00BB", "para": "\u00B6", "sect": "\u00A7",
+	"middot": "\u00B7", "bull": "\u2022", "deg": "\u00B0", "plusmn": "\u00B1",
+	"times": "\u00D7", "divide": "\u00F7", "pound": "\u00A3", "euro": "\u20AC",
+	"yen": "\u00A5", "cent": "\u00A2",
+	"Auml": "\u00C4", "Ouml": "\u00D6", "Uuml": "\u00DC",
+	"auml": "\u00E4", "ouml": "\u00F6", "uuml": "\u00FC", "szlig": "\u00DF",
+	"agrave": "\u00E0", "eacute": "\u00E9", "egrave": "\u00E8",
+	"aring": "\u00E5", "oslash": "\u00F8", "AElig": "\u00C6", "aelig": "\u00E6",
+	"frac12": "\u00BD", "frac14": "\u00BC", "frac34": "\u00BE",
+	"iexcl": "\u00A1", "iquest": "\u00BF",
+}
+
+var reEntityRef = regexp.MustCompile(
+	`^&(#[xX][0-9a-fA-F]{1,6};|#[0-9]{1,7};|[a-zA-Z][a-zA-Z0-9]{1,31};)`,
+)
+
+// decodeEntity returns the Unicode string for a full entity reference
+// (including the leading & and trailing ;), or empty string + ok=false
+// if the reference is not recognized. Invalid or zero-code-point numeric
+// references return U+FFFD.
+func decodeEntity(ref string) (string, bool) {
+	if len(ref) < 3 || ref[0] != '&' || ref[len(ref)-1] != ';' {
+		return "", false
+	}
+	body := ref[1 : len(ref)-1]
+	if len(body) > 1 && body[0] == '#' && (body[1] == 'x' || body[1] == 'X') {
+		var n int64
+		fmt.Sscanf(body[2:], "%x", &n)
+		if n == 0 || n > 0x10ffff {
+			return "\uFFFD", true
+		}
+		return string(rune(n)), true
+	}
+	if len(body) > 0 && body[0] == '#' {
+		var n int64
+		fmt.Sscanf(body[1:], "%d", &n)
+		if n == 0 || n > 0x10ffff {
+			return "\uFFFD", true
+		}
+		return string(rune(n)), true
+	}
+	if v, ok := namedEntities[body]; ok {
+		return v, true
+	}
+	return "", false
+}
+
+// renderInline processes block-level text as inline markdown, currently
+// handling backslash escapes, entity/numeric references, and hard line
+// breaks. All other characters are HTML-escaped as needed.
+func renderInline(s string) string {
+	var b strings.Builder
+	i := 0
+	n := len(s)
+
+	for i < n {
+		c := s[i]
+
+		// Backslash escape or hard line break via backslash.
+		if c == '\\' && i+1 < n {
+			next := s[i+1]
+			if next == '\n' {
+				b.WriteString("<br />\n")
+				i += 2
+				continue
+			}
+			if strings.IndexByte(backslashEscapable, next) >= 0 {
+				b.WriteString(escapeHTMLByte(next))
+				i += 2
+				continue
+			}
+		}
+
+		// Entity or numeric character reference.
+		if c == '&' {
+			m := reEntityRef.FindStringIndex(s[i:])
+			if m != nil {
+				ref := s[i : i+m[1]]
+				if decoded, ok := decodeEntity(ref); ok {
+					b.WriteString(escapeHTMLString(decoded))
+					i += m[1]
+					continue
+				}
+			}
+		}
+
+		// Hard line break via 2+ trailing spaces.
+		if c == '\n' {
+			out := b.String()
+			trailing := 0
+			for trailing < len(out) && out[len(out)-1-trailing] == ' ' {
+				trailing++
+			}
+			if trailing >= 2 {
+				b.Reset()
+				b.WriteString(out[:len(out)-trailing])
+				b.WriteString("<br />\n")
+				i++
+				continue
+			}
+			b.WriteByte('\n')
+			i++
+			continue
+		}
+
+		b.WriteString(escapeHTMLByte(c))
+		i++
+	}
+
+	return b.String()
+}
+
+func escapeHTMLByte(c byte) string {
+	switch c {
+	case '&':
+		return "&amp;"
+	case '<':
+		return "&lt;"
+	case '>':
+		return "&gt;"
+	case '"':
+		return "&quot;"
+	}
+	return string(c)
+}
+
+func escapeHTMLString(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '&':
+			b.WriteString("&amp;")
+		case '<':
+			b.WriteString("&lt;")
+		case '>':
+			b.WriteString("&gt;")
+		case '"':
+			b.WriteString("&quot;")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // ToHTML concatenates per-block html fields, each followed by a newline.
