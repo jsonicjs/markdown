@@ -715,15 +715,57 @@ func decodeEntity(ref string) (string, bool) {
 	return "", false
 }
 
-// renderInline processes block-level text as inline markdown. It currently
-// handles:
-//   - backslash escapes (\<punct> or \<newline>)
-//   - entity / numeric character references
-//   - hard line breaks (2+ trailing spaces before \n, or backslash before \n)
-//   - code spans (`...`, with matching-length backtick runs)
-// All other characters are HTML-escaped as needed.
-func renderInline(s string) string {
-	var b strings.Builder
+// inlineSegKind enumerates the kinds of segments produced by the inline
+// tokenizer.
+type inlineSegKind int
+
+const (
+	segText inlineSegKind = iota
+	segHTML
+	segDelim
+)
+
+// inlineSeg is a segment produced by the inline tokenizer. Text segments
+// need HTML-escaping at render time; HTML segments are already-safe HTML
+// atoms (code span output, decoded entities, escape output, hard breaks);
+// delim segments are `*`/`_` runs that the emphasis pass may consume.
+type inlineSeg struct {
+	kind     inlineSegKind
+	value    string
+	char     byte
+	length   int
+	canOpen  bool
+	canClose bool
+}
+
+// asciiPunct reports whether b is an ASCII punctuation character used by
+// CommonMark's flanking classification (approximation; the full spec uses
+// Unicode punctuation).
+func asciiPunct(b byte) bool {
+	return (b >= '!' && b <= '/') ||
+		(b >= ':' && b <= '@') ||
+		(b >= '[' && b <= '`') ||
+		(b >= '{' && b <= '~')
+}
+
+func isInlineWS(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// tokenizeInline produces a flat segment list. Code spans, entity refs,
+// backslash escapes, and hard breaks are resolved into HTML segments;
+// plain text accumulates into text segments; runs of `*`/`_` are classified
+// and emitted as delim segments for the emphasis pass.
+func tokenizeInline(s string) []*inlineSeg {
+	segs := []*inlineSeg{}
+	appendText := func(t string) {
+		if len(segs) > 0 && segs[len(segs)-1].kind == segText {
+			segs[len(segs)-1].value += t
+			return
+		}
+		segs = append(segs, &inlineSeg{kind: segText, value: t})
+	}
+
 	i := 0
 	n := len(s)
 
@@ -734,27 +776,23 @@ func renderInline(s string) string {
 		if c == '\\' && i+1 < n {
 			next := s[i+1]
 			if next == '\n' {
-				b.WriteString("<br />\n")
+				segs = append(segs, &inlineSeg{kind: segHTML, value: "<br />\n"})
 				i += 2
 				continue
 			}
 			if strings.IndexByte(backslashEscapable, next) >= 0 {
-				b.WriteString(escapeHTMLByte(next))
+				segs = append(segs, &inlineSeg{kind: segHTML, value: escapeHTMLByte(next)})
 				i += 2
 				continue
 			}
 		}
 
-		// Code span: a run of N backticks is closed by the next run of
-		// exactly N backticks. Content is literal, newlines collapse to
-		// spaces, and a single matching leading+trailing space is stripped
-		// when both exist and the content is not all spaces.
+		// Code span.
 		if c == '`' {
 			openLen := 1
 			for i+openLen < n && s[i+openLen] == '`' {
 				openLen++
 			}
-
 			j := i + openLen
 			found := -1
 			for j < n {
@@ -772,7 +810,6 @@ func renderInline(s string) string {
 					j++
 				}
 			}
-
 			if found >= 0 {
 				content := s[i+openLen : found]
 				content = strings.ReplaceAll(content, "\r\n", " ")
@@ -784,15 +821,14 @@ func renderInline(s string) string {
 					strings.IndexFunc(content, func(r rune) bool { return r != ' ' }) >= 0 {
 					content = content[1 : len(content)-1]
 				}
-				b.WriteString("<code>")
-				b.WriteString(escapeHTMLString(content))
-				b.WriteString("</code>")
+				segs = append(segs, &inlineSeg{
+					kind:  segHTML,
+					value: "<code>" + escapeHTMLString(content) + "</code>",
+				})
 				i = found + openLen
 				continue
 			}
-
-			// No matching close: emit the backticks literally.
-			b.WriteString(strings.Repeat("`", openLen))
+			appendText(strings.Repeat("`", openLen))
 			i += openLen
 			continue
 		}
@@ -803,37 +839,178 @@ func renderInline(s string) string {
 			if m != nil {
 				ref := s[i : i+m[1]]
 				if decoded, ok := decodeEntity(ref); ok {
-					b.WriteString(escapeHTMLString(decoded))
+					segs = append(segs, &inlineSeg{kind: segHTML, value: escapeHTMLString(decoded)})
 					i += m[1]
 					continue
 				}
 			}
 		}
 
+		// Emphasis delimiter run.
+		if c == '*' || c == '_' {
+			length := 1
+			for i+length < n && s[i+length] == c {
+				length++
+			}
+			var before, after byte = ' ', ' '
+			if i > 0 {
+				before = s[i-1]
+			}
+			if i+length < n {
+				after = s[i+length]
+			}
+			beforeWS := isInlineWS(before)
+			afterWS := isInlineWS(after)
+			beforeP := asciiPunct(before)
+			afterP := asciiPunct(after)
+
+			leftFlanking := !afterWS && (!afterP || beforeWS || beforeP)
+			rightFlanking := !beforeWS && (!beforeP || afterWS || afterP)
+
+			canOpen := leftFlanking
+			canClose := rightFlanking
+			if c == '_' {
+				canOpen = leftFlanking && (!rightFlanking || beforeP)
+				canClose = rightFlanking && (!leftFlanking || afterP)
+			}
+
+			segs = append(segs, &inlineSeg{
+				kind:     segDelim,
+				char:     c,
+				length:   length,
+				canOpen:  canOpen,
+				canClose: canClose,
+			})
+			i += length
+			continue
+		}
+
 		// Hard line break via 2+ trailing spaces.
 		if c == '\n' {
-			out := b.String()
-			trailing := 0
-			for trailing < len(out) && out[len(out)-1-trailing] == ' ' {
-				trailing++
+			if len(segs) > 0 {
+				last := segs[len(segs)-1]
+				if last.kind == segText && strings.HasSuffix(last.value, "  ") {
+					last.value = strings.TrimRight(last.value, " ")
+					if last.value == "" {
+						segs = segs[:len(segs)-1]
+					}
+					segs = append(segs, &inlineSeg{kind: segHTML, value: "<br />\n"})
+					i++
+					continue
+				}
 			}
-			if trailing >= 2 {
-				b.Reset()
-				b.WriteString(out[:len(out)-trailing])
-				b.WriteString("<br />\n")
-				i++
-				continue
-			}
-			b.WriteByte('\n')
+			appendText("\n")
 			i++
 			continue
 		}
 
-		b.WriteString(escapeHTMLByte(c))
+		appendText(string(c))
 		i++
 	}
 
+	return segs
+}
+
+// processEmphasis walks the segment list, matching close delimiters with
+// prior opening delimiters to wrap enclosed content in <em> / <strong>.
+// Follows CommonMark's delimiter-stack algorithm (§ 6.4) with an ASCII
+// punctuation approximation.
+func processEmphasis(segs []*inlineSeg) []*inlineSeg {
+	i := 0
+	for i < len(segs) {
+		closer := segs[i]
+		if closer.kind != segDelim || !closer.canClose {
+			i++
+			continue
+		}
+
+		j := i - 1
+		matched := -1
+		for j >= 0 {
+			op := segs[j]
+			if op.kind == segDelim && op.canOpen && op.char == closer.char {
+				bothCanOpenClose := (op.canOpen && op.canClose) || (closer.canOpen && closer.canClose)
+				sum := op.length + closer.length
+				if !bothCanOpenClose ||
+					sum%3 != 0 ||
+					(op.length%3 == 0 && closer.length%3 == 0) {
+					matched = j
+					break
+				}
+			}
+			j--
+		}
+
+		if matched < 0 {
+			i++
+			continue
+		}
+
+		op := segs[matched]
+		useStrong := op.length >= 2 && closer.length >= 2
+		consume := 1
+		tag := "em"
+		if useStrong {
+			consume = 2
+			tag = "strong"
+		}
+
+		inner := append([]*inlineSeg{}, segs[matched+1:i]...)
+		op.length -= consume
+		closer.length -= consume
+
+		replacement := []*inlineSeg{}
+		if op.length > 0 {
+			replacement = append(replacement, op)
+		}
+		replacement = append(replacement, &inlineSeg{kind: segHTML, value: "<" + tag + ">"})
+		replacement = append(replacement, inner...)
+		replacement = append(replacement, &inlineSeg{kind: segHTML, value: "</" + tag + ">"})
+		if closer.length > 0 {
+			replacement = append(replacement, closer)
+		}
+
+		// Splice: replace segs[matched..i] with replacement.
+		tail := append([]*inlineSeg{}, segs[i+1:]...)
+		segs = append(segs[:matched], append(replacement, tail...)...)
+
+		openerRetained := 0
+		if op.length > 0 {
+			openerRetained = 1
+		}
+		i = matched + openerRetained + 1
+	}
+	return segs
+}
+
+// renderSegments produces the final HTML string. Leftover delim segments
+// (unmatched) are rendered as literal characters.
+func renderSegments(segs []*inlineSeg) string {
+	var b strings.Builder
+	for _, s := range segs {
+		switch s.kind {
+		case segText:
+			b.WriteString(escapeHTMLString(s.value))
+		case segHTML:
+			b.WriteString(s.value)
+		case segDelim:
+			b.WriteString(escapeHTMLString(strings.Repeat(string(s.char), s.length)))
+		}
+	}
 	return b.String()
+}
+
+// renderInline processes block-level text as inline markdown. It handles:
+//   - backslash escapes (\<punct> or \<newline>)
+//   - entity / numeric character references
+//   - hard line breaks
+//   - code spans
+//   - emphasis and strong (`*` / `_` delimiter runs)
+// Links, images, autolinks, and raw HTML are not yet implemented.
+func renderInline(s string) string {
+	segs := tokenizeInline(s)
+	segs = processEmphasis(segs)
+	return renderSegments(segs)
 }
 
 func escapeHTMLByte(c byte) string {

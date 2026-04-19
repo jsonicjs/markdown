@@ -606,16 +606,42 @@ function decodeEntity(ref: string): string | null {
   return named === undefined ? null : named
 }
 
-// renderInline processes block-level text as inline markdown. It currently
-// handles:
-//   - backslash escapes (\<punct> or \<newline>)
-//   - entity / numeric character references
-//   - hard line breaks (2+ trailing spaces before \n, or backslash before \n)
-//   - code spans (`...`, with matching-length backtick runs)
-// All other characters are HTML-escaped as needed. Inline emphasis, links,
-// and autolinks are not yet implemented.
-function renderInline(s: string): string {
-  let out = ''
+// InlineSeg is a segment produced by the inline tokenizer. Text segments
+// need HTML-escaping at render time; html segments are already-safe HTML
+// atoms (code span output, decoded entities, escape output, hard breaks);
+// delim segments are `*`/`_` runs that the emphasis pass may consume.
+type InlineSeg =
+  | { kind: 'text'; value: string }
+  | { kind: 'html'; value: string }
+  | {
+      kind: 'delim'
+      char: '*' | '_'
+      length: number
+      canOpen: boolean
+      canClose: boolean
+    }
+
+// ASCII punctuation used for CommonMark flanking classification. The full
+// spec uses Unicode punctuation; this is a close ASCII approximation.
+const ASCII_PUNCT = /[!-/:-@\[-`{-~]/
+
+function isWhitespaceChar(c: string): boolean {
+  return c === '' || c === ' ' || c === '\t' || c === '\n' || c === '\r'
+}
+
+// tokenizeInline walks the input and produces a flat segment list. Code
+// spans, entity refs, backslash escapes, and hard breaks are resolved into
+// `html` segments; plain text accumulates into `text` segments; runs of
+// `*`/`_` are classified and emitted as `delim` segments for the emphasis
+// pass to consume.
+function tokenizeInline(s: string): InlineSeg[] {
+  const segs: InlineSeg[] = []
+  const appendText = (t: string) => {
+    const last = segs[segs.length - 1]
+    if (last && last.kind === 'text') last.value += t
+    else segs.push({ kind: 'text', value: t })
+  }
+
   let i = 0
   const n = s.length
 
@@ -626,21 +652,18 @@ function renderInline(s: string): string {
     if (c === '\\' && i + 1 < n) {
       const next = s[i + 1]
       if (next === '\n') {
-        out += '<br />\n'
+        segs.push({ kind: 'html', value: '<br />\n' })
         i += 2
         continue
       }
       if (BACKSLASH_ESCAPABLE.indexOf(next) >= 0) {
-        out += escapeHtmlChar(next)
+        segs.push({ kind: 'html', value: escapeHtmlChar(next) })
         i += 2
         continue
       }
     }
 
-    // Code span: a run of N backticks is closed by the next run of exactly
-    // N backticks. Content is literal (no inline processing), newlines
-    // collapse to spaces, and a single matching leading+trailing space is
-    // stripped when both exist and the content is not all spaces.
+    // Code span.
     if (c === '`') {
       let openLen = 1
       while (i + openLen < n && s[i + openLen] === '`') openLen++
@@ -671,13 +694,15 @@ function renderInline(s: string): string {
         ) {
           content = content.slice(1, -1)
         }
-        out += '<code>' + escapeHtmlString(content) + '</code>'
+        segs.push({
+          kind: 'html',
+          value: '<code>' + escapeHtmlString(content) + '</code>',
+        })
         i = found + openLen
         continue
       }
 
-      // No matching close: emit the backticks literally and continue.
-      out += '`'.repeat(openLen)
+      appendText('`'.repeat(openLen))
       i += openLen
       continue
     }
@@ -692,34 +717,153 @@ function renderInline(s: string): string {
       if (m) {
         const decoded = decodeEntity('&' + m[1])
         if (decoded !== null) {
-          out += escapeHtmlString(decoded)
+          segs.push({ kind: 'html', value: escapeHtmlString(decoded) })
           i += m[0].length
           continue
         }
       }
     }
 
+    // Emphasis delimiter run.
+    if (c === '*' || c === '_') {
+      let length = 1
+      while (i + length < n && s[i + length] === c) length++
+
+      const before = i === 0 ? ' ' : s[i - 1]
+      const after = i + length >= n ? ' ' : s[i + length]
+      const beforeWs = isWhitespaceChar(before)
+      const afterWs = isWhitespaceChar(after)
+      const beforePunct = ASCII_PUNCT.test(before)
+      const afterPunct = ASCII_PUNCT.test(after)
+
+      const leftFlanking =
+        !afterWs && (!afterPunct || beforeWs || beforePunct)
+      const rightFlanking =
+        !beforeWs && (!beforePunct || afterWs || afterPunct)
+
+      let canOpen = leftFlanking
+      let canClose = rightFlanking
+      if (c === '_') {
+        canOpen = leftFlanking && (!rightFlanking || beforePunct)
+        canClose = rightFlanking && (!leftFlanking || afterPunct)
+      }
+
+      segs.push({ kind: 'delim', char: c, length, canOpen, canClose })
+      i += length
+      continue
+    }
+
     // Hard line break via 2+ trailing spaces.
     if (c === '\n') {
-      let trailing = 0
-      while (trailing < out.length && out[out.length - 1 - trailing] === ' ') {
-        trailing++
-      }
-      if (trailing >= 2) {
-        out = out.slice(0, out.length - trailing) + '<br />\n'
+      const last = segs[segs.length - 1]
+      if (last && last.kind === 'text' && /  $/.test(last.value)) {
+        last.value = last.value.replace(/ +$/, '')
+        if (last.value.length === 0) segs.pop()
+        segs.push({ kind: 'html', value: '<br />\n' })
         i++
         continue
       }
-      out += '\n'
+      appendText('\n')
       i++
       continue
     }
 
-    out += escapeHtmlChar(c)
+    appendText(c)
     i++
   }
 
+  return segs
+}
+
+// processEmphasis walks the segment list, matching close delimiters with
+// prior opening delimiters of the same character to wrap the enclosed
+// content in <em> / <strong> tags. Follows CommonMark's delimiter-stack
+// algorithm (§ 6.4) with an ASCII punctuation approximation.
+function processEmphasis(segs: InlineSeg[]): InlineSeg[] {
+  let i = 0
+  while (i < segs.length) {
+    const closer = segs[i]
+    if (closer.kind !== 'delim' || !closer.canClose) {
+      i++
+      continue
+    }
+
+    // Scan back for a matching opener.
+    let j = i - 1
+    let matched = -1
+    while (j >= 0) {
+      const op = segs[j]
+      if (
+        op.kind === 'delim' &&
+        op.canOpen &&
+        op.char === closer.char
+      ) {
+        // Rule 9/10: avoid "odd match" where the sum of the two lengths
+        // is not a multiple of 3 but one of them is.
+        const bothCanOpenClose =
+          (op.canOpen && op.canClose) || (closer.canOpen && closer.canClose)
+        if (
+          !bothCanOpenClose ||
+          (op.length + closer.length) % 3 !== 0 ||
+          (op.length % 3 === 0 && closer.length % 3 === 0)
+        ) {
+          matched = j
+          break
+        }
+      }
+      j--
+    }
+
+    if (matched < 0) {
+      i++
+      continue
+    }
+
+    const op = segs[matched] as Extract<InlineSeg, { kind: 'delim' }>
+    const useStrong = op.length >= 2 && closer.length >= 2
+    const consume = useStrong ? 2 : 1
+    const tag = useStrong ? 'strong' : 'em'
+
+    const inner = segs.slice(matched + 1, i)
+    const replacement: InlineSeg[] = []
+    op.length -= consume
+    closer.length -= consume
+    if (op.length > 0) replacement.push(op)
+    replacement.push({ kind: 'html', value: `<${tag}>` })
+    replacement.push(...inner)
+    replacement.push({ kind: 'html', value: `</${tag}>` })
+    if (closer.length > 0) replacement.push(closer)
+
+    segs.splice(matched, i - matched + 1, ...replacement)
+    // Restart scan just after the opener to allow further matches inside.
+    i = matched + (op.length > 0 ? 1 : 0) + 1
+  }
+  return segs
+}
+
+// renderSegments produces the final HTML string. Leftover delim segments
+// (unmatched) are rendered as literal characters.
+function renderSegments(segs: InlineSeg[]): string {
+  let out = ''
+  for (const seg of segs) {
+    if (seg.kind === 'text') out += escapeHtmlString(seg.value)
+    else if (seg.kind === 'html') out += seg.value
+    else out += escapeHtmlString(seg.char.repeat(seg.length))
+  }
   return out
+}
+
+// renderInline processes block-level text as inline markdown. It handles:
+//   - backslash escapes (\<punct> or \<newline>)
+//   - entity / numeric character references
+//   - hard line breaks (2+ trailing spaces before \n, or backslash before \n)
+//   - code spans (`...`)
+//   - emphasis and strong (`*` / `_` delimiter runs)
+// Links, images, autolinks, and raw HTML are not yet implemented.
+function renderInline(s: string): string {
+  const segs = tokenizeInline(s)
+  processEmphasis(segs)
+  return renderSegments(segs)
 }
 
 function escapeHtmlChar(c: string): string {
