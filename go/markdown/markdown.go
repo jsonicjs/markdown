@@ -749,11 +749,27 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			kind := "text"
 
 			switch {
-			// Blank line.
+			// Blank line. If we're currently inside an indented-code
+			// block and this "blank" line actually has at least 4
+			// leading whitespace chars, preserve the stripped content
+			// as a code line instead of as a blank.
 			case reBlank.MatchString(lineContent):
-				srcPart := src[sI:consumeEnd]
-				tkn = lex.Token("#MB", tinFor(lex, "#MB"), nil, srcPart)
-				kind = "blank"
+				if state.last == "icode" &&
+					(strings.HasPrefix(lineContent, "    ") || strings.HasPrefix(lineContent, "\t")) {
+					var stripped string
+					if strings.HasPrefix(lineContent, "\t") {
+						stripped = lineContent[1:]
+					} else {
+						stripped = lineContent[4:]
+					}
+					srcPart := src[sI:consumeEnd]
+					tkn = lex.Token("#MIC", tinFor(lex, "#MIC"), stripped, srcPart)
+					kind = "icode"
+				} else {
+					srcPart := src[sI:consumeEnd]
+					tkn = lex.Token("#MB", tinFor(lex, "#MB"), nil, srcPart)
+					kind = "blank"
+				}
 
 			// HTML block: consume contiguous lines through the type's
 			// end marker (types 1-5) or through the next blank line

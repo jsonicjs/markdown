@@ -548,11 +548,26 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
 
       // Classify the line.
 
-      // Blank line.
+      // Blank line. If we're currently inside an indented-code block
+      // and this "blank" line actually has at least 4 leading
+      // whitespace chars, preserve the stripped content as a code
+      // line instead of as a blank.
       if (/^[ \t]*$/.test(lineContent)) {
-        srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#MB', null, srcPart, pnt)
-        kind = 'blank'
+        if (
+          state.last === 'icode' &&
+          (lineContent.startsWith('    ') || lineContent.startsWith('\t'))
+        ) {
+          const stripped = lineContent.startsWith('\t')
+            ? lineContent.slice(1)
+            : lineContent.slice(4)
+          srcPart = src.substring(sI, consumeEnd)
+          tkn = lex.token('#MIC', stripped, srcPart, pnt)
+          kind = 'icode'
+        } else {
+          srcPart = src.substring(sI, consumeEnd)
+          tkn = lex.token('#MB', null, srcPart, pnt)
+          kind = 'blank'
+        }
       }
 
       // HTML block: consume contiguous lines through the type's end marker
