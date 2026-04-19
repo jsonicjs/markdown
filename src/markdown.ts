@@ -501,6 +501,7 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         last: string
         listContentCol: number
         listMarkerId?: string
+        listItemEmpty?: boolean
       } =
         lexAny.__md ??
         (lexAny.__md = { last: 'start', listContentCol: 0 })
@@ -587,6 +588,23 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token('#MHB', htmlText, srcPart, pnt)
         kind = 'htmlblock'
+      }
+
+      // List item continuation at the active list's content column.
+      // When we're inside a list, a line indented to at least the item's
+      // content column is always a continuation, even if its stripped
+      // form would otherwise be a new block (HR, ATX heading, list
+      // marker, etc.). The sub-parse of the item's accumulated text
+      // applies those block classifications on the stripped content.
+      else if (
+        state.listContentCol > 0 &&
+        lineContent.length >= state.listContentCol &&
+        lineContent.slice(0, state.listContentCol).trim() === ''
+      ) {
+        const stripped = lineContent.slice(state.listContentCol)
+        srcPart = src.substring(sI, consumeEnd)
+        tkn = lex.token('#MLC', stripped, srcPart, pnt)
+        kind = 'listcont'
       }
 
       // Fenced code block start: 3+ backticks or 3+ tildes with up to 3
@@ -701,22 +719,6 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token('#MR', null, srcPart, pnt)
         kind = 'hr'
-      }
-
-      // List item continuation at the active list's content column.
-      // Runs BEFORE the list-marker checks so a line like `  - b` after
-      // `- a` (content column 2) attaches as continuation text of item
-      // `a` rather than opening a new top-level list entry. The sub-parse
-      // of the item's accumulated text then forms the nested list.
-      else if (
-        state.listContentCol > 0 &&
-        lineContent.length >= state.listContentCol &&
-        lineContent.slice(0, state.listContentCol).trim() === ''
-      ) {
-        const stripped = lineContent.slice(state.listContentCol)
-        srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#MLC', stripped, srcPart, pnt)
-        kind = 'listcont'
       }
 
       // Ordered list item. CommonMark limits the marker to 1-9 digits, and
@@ -854,6 +856,21 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       ) {
         state.listContentCol = 0
         state.listMarkerId = undefined
+        state.listItemEmpty = false
+      }
+
+      // Track whether the most recently opened list item is still empty.
+      // A blank line following an empty item ends the list per CommonMark
+      // (§ 5.2: "A list item can begin with at most one blank line").
+      if (kind === 'list') {
+        const v = (tkn as any).val
+        state.listItemEmpty = !v || v.text === ''
+      } else if (kind === 'listcont') {
+        state.listItemEmpty = false
+      } else if (kind === 'blank' && state.listItemEmpty) {
+        state.listContentCol = 0
+        state.listMarkerId = undefined
+        state.listItemEmpty = false
       }
 
       // Advance the lex point past the consumed span, tracking row/column.
@@ -969,16 +986,19 @@ function renderListItem(
   if (!loose && parts.length === 1 && !parts[0].startsWith('<')) {
     return `<li>${parts[0]}</li>`
   }
-  // If the first part is inline text from a tight paragraph, keep it
-  // flush with the `<li>` open tag (no leading newline) to match
-  // CommonMark's `<li>a\n<ul>...` shape. Subsequent parts still get a
-  // leading `\n` separator.
+  // Tight-mode inline text at the first or last slot sits flush against
+  // the `<li>` boundary (no leading/trailing newline). This matches
+  // CommonMark's `<li>a\n<ul>...</ul>\n</li>` and
+  // `<li>\n<h2>Bar</h2>\nbaz</li>` shapes.
   const firstInline = !loose && parts[0] && !parts[0].startsWith('<')
-  if (firstInline) {
-    const rest = parts.slice(1).join('\n')
-    return `<li>${parts[0]}\n${rest}\n</li>`
-  }
-  return `<li>\n${parts.join('\n')}\n</li>`
+  const lastInline =
+    !loose &&
+    parts.length > 0 &&
+    !parts[parts.length - 1].startsWith('<')
+  const open = firstInline ? `<li>${parts[0]}\n` : `<li>\n`
+  const mid = (firstInline ? parts.slice(1) : parts).join('\n')
+  const close = lastInline ? `</li>` : `\n</li>`
+  return `${open}${mid}${close}`
 }
 
 // parseNested runs the markdown parser on a substring for use inside a

@@ -674,6 +674,7 @@ func isHorizontalRule(s string) bool {
 type lexState struct {
 	last           string // last emitted token kind
 	listContentCol int    // content column of current list item, 0 if none
+	listItemEmpty  bool   // current item has no content yet
 }
 
 var lexStates = map[*jsonic.Lex]*lexState{}
@@ -788,6 +789,19 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				tkn = lex.Token("#MHB", tinFor(lex, "#MHB"), htmlText, srcPart)
 				kind = "htmlblock"
 
+			// List item continuation at the active list's content column.
+			// When we're inside a list, a line indented to at least the
+			// item's content column is always a continuation, even if
+			// its stripped form would otherwise be a new block (HR, ATX
+			// heading, list marker, etc.).
+			case state.listContentCol > 0 &&
+				len(lineContent) >= state.listContentCol &&
+				strings.TrimLeft(lineContent[:state.listContentCol], " ") == "":
+				stripped := lineContent[state.listContentCol:]
+				srcPart := src[sI:consumeEnd]
+				tkn = lex.Token("#MLC", tinFor(lex, "#MLC"), stripped, srcPart)
+				kind = "listcont"
+
 			// Fenced code block: 3+ backticks or 3+ tildes with up to 3
 			// leading spaces. Close must use same char, length >= open.
 			case reFenceOpen.MatchString(lineContent):
@@ -890,17 +904,6 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				tkn = lex.Token("#MR", tinFor(lex, "#MR"), nil, srcPart)
 				kind = "hr"
 
-			// List item continuation at the active list's content column.
-			// Runs BEFORE the list-marker checks so a deeper-indented
-			// marker attaches as continuation text and the sub-parse
-			// of the item forms the nested list.
-			case state.listContentCol > 0 &&
-				len(lineContent) >= state.listContentCol &&
-				strings.TrimLeft(lineContent[:state.listContentCol], " ") == "":
-				stripped := lineContent[state.listContentCol:]
-				srcPart := src[sI:consumeEnd]
-				tkn = lex.Token("#MLC", tinFor(lex, "#MLC"), stripped, srcPart)
-				kind = "listcont"
 
 			// Ordered list item. An ordered list can only interrupt a
 			// paragraph with start == 1.
@@ -1007,6 +1010,27 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			// Reset list continuation tracking when we leave list context.
 			if kind != "list" && kind != "listcont" && kind != "blank" {
 				state.listContentCol = 0
+				state.listItemEmpty = false
+			}
+
+			// Track whether the most recently opened list item is empty
+			// so a blank line following it ends the list per CommonMark
+			// § 5.2 ("A list item can begin with at most one blank line").
+			switch kind {
+			case "list":
+				if v, ok := tkn.Val.(map[string]any); ok {
+					txt, _ := v["text"].(string)
+					state.listItemEmpty = txt == ""
+				} else {
+					state.listItemEmpty = true
+				}
+			case "listcont":
+				state.listItemEmpty = false
+			case "blank":
+				if state.listItemEmpty {
+					state.listContentCol = 0
+					state.listItemEmpty = false
+				}
 			}
 
 			// Advance the lex cursor past the consumed span, tracking row/column.
