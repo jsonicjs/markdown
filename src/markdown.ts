@@ -1322,6 +1322,11 @@ type InlineSeg =
       // links, whose label must be matched with backslash escapes kept
       // intact per the CommonMark label equality rule.
       srcPos?: number
+      // Opener removed from the "delimiter stack" by a preceding closer
+      // that found it but failed to form a link. Subsequent closers skip
+      // it entirely (per CommonMark's pop-on-fail rule), so no later
+      // closer can match across a removed opener to an even earlier one.
+      removed?: boolean
     }
 
 // Link reference definition — produced by extracting `[label]: url "title"`
@@ -1819,7 +1824,14 @@ function innerText(segs: InlineSeg[]): string {
     if (seg.kind === 'text') out += seg.value
     else if (seg.kind === 'delim') out += seg.char.repeat(seg.length)
     else if (seg.kind === 'bracket') {
-      out += seg.open ? (seg.image ? '![' : '[') : ']'
+      // Use the full source text for closers so unmatched inline /
+      // ref-style suffixes (e.g. `](uri2)`) remain visible in the
+      // outer alt string (spec example 520).
+      if (!seg.open && seg.srcText && seg.srcText.length > 1) {
+        out += seg.srcText
+      } else {
+        out += seg.open ? (seg.image ? '![' : '[') : ']'
+      }
     } else {
       // html segment — strip tags but pull `alt="..."` from `<img>` so
       // nested images contribute their alt text to the outer alt.
@@ -2178,14 +2190,27 @@ function processLinks(
     }
 
     let j = i - 1
+    // Per CM § 6.4: scan back and pop the topmost (nearest) opener
+    // that is still on the stack (`!removed`). If it's inactive,
+    // discard it and render this `]` as literal; further closers then
+    // cannot reach any still-active opener that sat behind it.
     let openIdx = -1
+    let nearestIdx = -1
     while (j >= 0) {
       const op = segs[j]
-      if (op.kind === 'bracket' && op.open && op.active) {
-        openIdx = j
+      if (op.kind === 'bracket' && op.open && !op.removed) {
+        nearestIdx = j
+        if (op.active) openIdx = j
         break
       }
       j--
+    }
+    if (openIdx < 0 && nearestIdx >= 0) {
+      const staleOpen = segs[nearestIdx] as Extract<
+        InlineSeg,
+        { kind: 'bracket' }
+      >
+      staleOpen.removed = true
     }
 
     const open =
@@ -2278,7 +2303,12 @@ function processLinks(
           segs.splice(i + 1, 0, ...extra)
         }
       }
-      if (open) open.active = false
+      if (open) {
+        // Pop this opener off the delimiter stack so a later `]` can't
+        // sneak back to an even earlier active opener (spec example 520).
+        open.active = false
+        open.removed = true
+      }
       i++
       continue
     }

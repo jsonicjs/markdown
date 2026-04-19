@@ -1552,6 +1552,10 @@ type inlineSeg struct {
 	// links, whose label must be matched with backslash escapes kept
 	// intact per CommonMark's label equality rule. -1 means unset.
 	srcPos int
+	// Opener removed from the "delimiter stack" by a preceding closer
+	// that found it but failed to form a link. Subsequent closers skip
+	// it entirely (per CommonMark's pop-on-fail rule).
+	removed bool
 }
 
 // LinkRef is a link reference definition extracted from the block list.
@@ -2185,6 +2189,11 @@ func innerText(segs []*inlineSeg) string {
 				} else {
 					b.WriteString("[")
 				}
+			} else if len(s.srcText) > 1 {
+				// Unmatched inline / ref-style closer: render the full
+				// source text so the suffix (e.g. `](uri2)`) remains
+				// visible in the outer alt string (spec example 520).
+				b.WriteString(s.srcText)
 			} else {
 				b.WriteString("]")
 			}
@@ -2558,13 +2567,24 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap, src string) []*inlineSeg {
 			continue
 		}
 
+		// Per CM § 6.4: pop the topmost (nearest) opener that is still
+		// on the stack (`!removed`). If it's inactive, discard it and
+		// render this `]` as literal; further closers then cannot reach
+		// any still-active opener behind it (spec example 520).
 		openIdx := -1
+		nearestIdx := -1
 		for j := i - 1; j >= 0; j-- {
-			op := segs[j]
-			if op.kind == segBracket && op.open && op.active {
-				openIdx = j
+			cand := segs[j]
+			if cand.kind == segBracket && cand.open && !cand.removed {
+				nearestIdx = j
+				if cand.active {
+					openIdx = j
+				}
 				break
 			}
+		}
+		if openIdx < 0 && nearestIdx >= 0 {
+			segs[nearestIdx].removed = true
 		}
 
 		var op *inlineSeg
@@ -2656,7 +2676,11 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap, src string) []*inlineSeg {
 				}
 			}
 			if op != nil {
+				// Pop this opener off the delimiter stack so a later
+				// `]` can't sneak back to an earlier active opener
+				// (spec example 520).
 				op.active = false
+				op.removed = true
 			}
 			i++
 			continue
