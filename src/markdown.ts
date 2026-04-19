@@ -28,6 +28,7 @@ type MdBlock =
       ordered: boolean
       items: { text: string }[]
       loose?: boolean
+      start?: number
       html?: string
     }
   | { type: 'blockquote'; text: string; html?: string }
@@ -188,11 +189,18 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
     },
 
     '@list-start': (r: Rule, ctx: Context) => {
-      const v = r.o0.val as { ordered: boolean; text: string }
+      const v = r.o0.val as {
+        ordered: boolean
+        text: string
+        start?: number
+      }
       const block: any = {
         type: 'list',
         ordered: v.ordered,
         items: [{ text: v.text }],
+      }
+      if (v.ordered && v.start !== undefined && v.start !== 1) {
+        block.start = v.start
       }
       r.node.push(block)
       ctx.u.mdCurrent = block
@@ -585,13 +593,19 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         kind = 'hr'
       }
 
-      // Ordered list item.
-      else if (/^ {0,3}\d+[.)][ \t]/.test(lineContent)) {
-        const m = lineContent.match(/^( {0,3})(\d+[.)])([ \t]+)(.*)$/)!
-        const contentCol = m[1].length + m[2].length + m[3].length
+      // Ordered list item. CommonMark limits the marker to 1-9 digits.
+      else if (/^ {0,3}\d{1,9}[.)][ \t]/.test(lineContent)) {
+        const m = lineContent.match(/^( {0,3})(\d{1,9})([.)])([ \t]+)(.*)$/)!
+        const contentCol = m[1].length + m[2].length + 1 + m[4].length
         state.listContentCol = contentCol
+        const start = parseInt(m[2], 10)
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#ML', { ordered: true, text: m[4] }, srcPart, pnt)
+        tkn = lex.token(
+          '#ML',
+          { ordered: true, text: m[5], start },
+          srcPart,
+          pnt,
+        )
         kind = 'list'
       }
 
@@ -614,11 +628,17 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         kind = 'list'
       }
 
-      else if (/^ {0,3}\d+[.)][ \t]*$/.test(lineContent)) {
-        const m = lineContent.match(/^( {0,3})(\d+[.)])/)!
-        state.listContentCol = m[1].length + m[2].length + 1
+      else if (/^ {0,3}\d{1,9}[.)][ \t]*$/.test(lineContent)) {
+        const m = lineContent.match(/^( {0,3})(\d{1,9})([.)])/)!
+        state.listContentCol = m[1].length + m[2].length + 2
+        const start = parseInt(m[2], 10)
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#ML', { ordered: true, text: '' }, srcPart, pnt)
+        tkn = lex.token(
+          '#ML',
+          { ordered: true, text: '', start },
+          srcPart,
+          pnt,
+        )
         kind = 'list'
       }
 
@@ -649,11 +669,12 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
 
       // Indented line (4+ spaces or leading tab): indented code block,
       // unless we're currently inside a paragraph (in which case it's
-      // paragraph continuation).
+      // paragraph continuation with leading whitespace stripped).
       else if (/^(?:    |\t)/.test(lineContent)) {
         if (state.last === 'text') {
+          const stripped = lineContent.replace(/^[ \t]+/, '')
           srcPart = src.substring(sI, consumeEnd)
-          tkn = lex.token('#MT', lineContent, srcPart, pnt)
+          tkn = lex.token('#MT', stripped, srcPart, pnt)
           kind = 'text'
         } else {
           const stripped = lineContent.startsWith('\t')
@@ -665,10 +686,11 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         }
       }
 
-      // Plain text line. Up to 3 leading spaces are spec-allowed slack;
-      // strip them so paragraph content starts flush.
+      // Plain text line. Leading whitespace on paragraph lines is not
+      // significant — strip it so both the first-line spec slack (up to
+      // 3 spaces) and any continuation-line indentation are normalized.
       else {
-        const stripped = lineContent.replace(/^ {0,3}/, '')
+        const stripped = lineContent.replace(/^[ \t]+/, '')
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token('#MT', stripped, srcPart, pnt)
         kind = 'text'
@@ -718,7 +740,10 @@ function renderHtml(block: any, refs: LinkRefMap = NO_REFS): string {
         refs,
       )}</h${block.level}>`
     case 'paragraph':
-      return `<p>${renderInline(block.text, refs)}</p>`
+      // Trailing whitespace on the final line of a paragraph is not
+      // significant (hard-break spaces are always followed by a \n and
+      // therefore internal); strip it before inline processing.
+      return `<p>${renderInline(block.text.replace(/[ \t]+$/, ''), refs)}</p>`
     case 'hr':
       return `<hr />`
     case 'code': {
@@ -735,10 +760,14 @@ function renderHtml(block: any, refs: LinkRefMap = NO_REFS): string {
     case 'list': {
       const tag = block.ordered ? 'ol' : 'ul'
       const loose = !!block.loose
+      const startAttr =
+        block.ordered && block.start !== undefined && block.start !== 1
+          ? ` start="${block.start}"`
+          : ''
       const items = block.items
         .map((it: any) => renderListItem(it.text, loose, refs))
         .join('\n')
-      return `<${tag}>\n${items}\n</${tag}>`
+      return `<${tag}${startAttr}>\n${items}\n</${tag}>`
     }
     case 'blockquote': {
       // Re-parse the blockquote's raw content as markdown so nested

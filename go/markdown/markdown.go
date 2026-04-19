@@ -212,6 +212,11 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				"ordered": v["ordered"],
 				"items":   []any{map[string]any{"text": v["text"]}},
 			}
+			if ord, _ := v["ordered"].(bool); ord {
+				if start, ok := v["start"].(int); ok && start != 1 {
+					block["start"] = start
+				}
+			}
 			pushBlock(r, block)
 			ensureMeta(ctx)["mdCurrent"] = block
 			// HTML deferred — list rendering sub-parses each item.
@@ -465,9 +470,9 @@ var (
 	reBlank         = regexp.MustCompile(`^[ \t]*$`)
 	reATX           = regexp.MustCompile(`^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$`)
 	reSetext        = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
-	reOrderedFull   = regexp.MustCompile(`^( {0,3})(\d+[.)])([ \t]+)(.*)$`)
+	reOrderedFull   = regexp.MustCompile(`^( {0,3})(\d{1,9})([.)])([ \t]+)(.*)$`)
 	reUnorderedFull = regexp.MustCompile(`^( {0,3})([-*+])([ \t]+)(.*)$`)
-	reOrderedBare   = regexp.MustCompile(`^( {0,3})(\d+[.)])[ \t]*$`)
+	reOrderedBare   = regexp.MustCompile(`^( {0,3})(\d{1,9})([.)])[ \t]*$`)
 	reUnorderedBare = regexp.MustCompile(`^( {0,3})[-*+][ \t]*$`)
 	reBlockquote    = regexp.MustCompile(`^ {0,3}>( ?)(.*)$`)
 )
@@ -789,8 +794,14 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			// Ordered list item.
 			case reOrderedFull.MatchString(lineContent):
 				m := reOrderedFull.FindStringSubmatch(lineContent)
-				state.listContentCol = len(m[1]) + len(m[2]) + len(m[3])
-				val := map[string]any{"ordered": true, "text": m[4]}
+				state.listContentCol = len(m[1]) + len(m[2]) + 1 + len(m[4])
+				start := 0
+				fmt.Sscanf(m[2], "%d", &start)
+				val := map[string]any{
+					"ordered": true,
+					"text":    m[5],
+					"start":   start,
+				}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
@@ -815,8 +826,14 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 
 			case reOrderedBare.MatchString(lineContent):
 				m := reOrderedBare.FindStringSubmatch(lineContent)
-				state.listContentCol = len(m[1]) + len(m[2]) + 1
-				val := map[string]any{"ordered": true, "text": ""}
+				state.listContentCol = len(m[1]) + len(m[2]) + 2
+				start := 0
+				fmt.Sscanf(m[2], "%d", &start)
+				val := map[string]any{
+					"ordered": true,
+					"text":    "",
+					"start":   start,
+				}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
@@ -841,8 +858,9 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			// continues a paragraph.
 			case strings.HasPrefix(lineContent, "    ") || strings.HasPrefix(lineContent, "\t"):
 				if state.last == "text" {
+					stripped := strings.TrimLeft(lineContent, " \t")
 					srcPart := src[sI:consumeEnd]
-					tkn = lex.Token("#MT", tinFor(lex, "#MT"), lineContent, srcPart)
+					tkn = lex.Token("#MT", tinFor(lex, "#MT"), stripped, srcPart)
 					kind = "text"
 				} else {
 					var stripped string
@@ -856,15 +874,10 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 					kind = "icode"
 				}
 
-			// Plain text line. Up to 3 leading spaces are allowed slack;
-			// strip them so paragraph content starts flush.
+			// Plain text line. Leading whitespace on paragraph lines is
+			// not significant — strip it.
 			default:
-				stripped := lineContent
-				lead := 0
-				for lead < 3 && lead < len(stripped) && stripped[lead] == ' ' {
-					lead++
-				}
-				stripped = stripped[lead:]
+				stripped := strings.TrimLeft(lineContent, " \t")
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#MT", tinFor(lex, "#MT"), stripped, srcPart)
 				kind = "text"
@@ -931,6 +944,9 @@ func renderBlockHTML(block map[string]any, refs LinkRefMap) string {
 
 	case "paragraph":
 		text, _ := block["text"].(string)
+		// Trailing whitespace on the paragraph's final line is not
+		// significant (hard-break spaces are always followed by \n).
+		text = strings.TrimRight(text, " \t")
 		return "<p>" + renderInline(text, refs) + "</p>"
 
 	case "hr":
@@ -951,14 +967,22 @@ func renderBlockHTML(block map[string]any, refs LinkRefMap) string {
 
 	case "list":
 		tag := "ul"
-		if ordered, _ := block["ordered"].(bool); ordered {
+		ordered, _ := block["ordered"].(bool)
+		if ordered {
 			tag = "ol"
 		}
 		loose, _ := block["loose"].(bool)
 		items, _ := block["items"].([]any)
+		startAttr := ""
+		if ordered {
+			if start, ok := block["start"].(int); ok && start != 1 {
+				startAttr = fmt.Sprintf(` start="%d"`, start)
+			}
+		}
 		var b strings.Builder
 		b.WriteString("<")
 		b.WriteString(tag)
+		b.WriteString(startAttr)
 		b.WriteString(">\n")
 		for i, it := range items {
 			if i > 0 {
