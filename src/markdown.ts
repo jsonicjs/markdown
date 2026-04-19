@@ -1913,41 +1913,55 @@ function processLinks(
       j--
     }
 
-    if (openIdx < 0) {
-      // Unmatched close bracket — deactivate and move on.
-      i++
-      continue
-    }
+    const open =
+      openIdx >= 0
+        ? (segs[openIdx] as Extract<InlineSeg, { kind: 'bracket' }>)
+        : null
+    const inner = openIdx >= 0 ? segs.slice(openIdx + 1, i) : []
 
-    const open = segs[openIdx] as Extract<InlineSeg, { kind: 'bracket' }>
-    const inner = segs.slice(openIdx + 1, i)
-
-    // Resolve the target: inline url, or lookup via refs.
+    // Resolve the target: inline url, or lookup via refs. Only attempted
+    // if we have a matching opener.
     let url: string | undefined
     let title: string | undefined
-    if (close.url !== undefined) {
-      url = close.url
-      title = close.title
-    } else {
-      let label: string | undefined
-      if (close.refLabel) {
-        label = close.refLabel
-      } else if (close.refCollapsed || close.refShortcut) {
-        label = innerText(inner)
-      }
-      if (label !== undefined) {
-        const ref = refs[normalizeLinkLabel(label)]
-        if (ref) {
-          url = ref.url
-          title = ref.title
+    if (openIdx >= 0) {
+      if (close.url !== undefined) {
+        url = close.url
+        title = close.title
+      } else {
+        let label: string | undefined
+        if (close.refLabel) {
+          label = close.refLabel
+        } else if (close.refCollapsed || close.refShortcut) {
+          label = innerText(inner)
+        }
+        if (label !== undefined) {
+          const ref = refs[normalizeLinkLabel(label)]
+          if (ref) {
+            url = ref.url
+            title = ref.title
+          }
         }
       }
     }
 
     if (url === undefined) {
-      // No match. Deactivate the open bracket (for shortcut only) and
-      // continue past this close bracket.
-      open.active = false
+      // No match. If this close bracket had consumed a `[label]` or `[]`
+      // reference suffix, break the suffix back out into separate bracket
+      // segments so the enclosed `[label]` can still form its own link
+      // in a later iteration (CommonMark does left-to-right matching;
+      // a failed full/collapsed ref releases its label for re-processing).
+      if (close.refLabel !== undefined || close.refCollapsed) {
+        const suffix = close.srcText.slice(1) // drop the leading `]`
+        close.refLabel = undefined
+        close.refCollapsed = false
+        close.refShortcut = true
+        close.srcText = ']'
+        if (suffix.length > 0) {
+          const extra = tokenizeInline(suffix)
+          segs.splice(i + 1, 0, ...extra)
+        }
+      }
+      if (open) open.active = false
       i++
       continue
     }
@@ -1956,8 +1970,11 @@ function processLinks(
     const nested = processLinks(inner, refs)
     processEmphasis(nested)
 
+    // At this point open must be non-null because url was resolved only
+    // when openIdx >= 0.
+    const openNN = open!
     let html: string
-    if (open.image) {
+    if (openNN.image) {
       const alt = innerText(nested)
       const titleAttr = title
         ? ` title="${escapeHtmlString(decodeLinkText(title))}"`
@@ -1980,7 +1997,7 @@ function processLinks(
 
     // Per CommonMark, matching a link deactivates all earlier `[` openers
     // to prevent nested <a> elements. (Images may still be nested.)
-    if (!open.image) {
+    if (!openNN.image) {
       for (let k = 0; k < openIdx; k++) {
         const s2 = segs[k]
         if (s2.kind === 'bracket' && s2.open && !s2.image) {

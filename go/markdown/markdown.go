@@ -2235,38 +2235,61 @@ func processLinks(segs []*inlineSeg, refs LinkRefMap) []*inlineSeg {
 				break
 			}
 		}
-		if openIdx < 0 {
-			i++
-			continue
-		}
 
-		op := segs[openIdx]
-		inner := append([]*inlineSeg{}, segs[openIdx+1:i]...)
+		var op *inlineSeg
+		var inner []*inlineSeg
+		if openIdx >= 0 {
+			op = segs[openIdx]
+			inner = append([]*inlineSeg{}, segs[openIdx+1:i]...)
+		}
 
 		var url, title string
 		hasTarget := false
-		if close.hasURL {
-			url = close.url
-			title = close.title
-			hasTarget = true
-		} else if close.hasRef && refs != nil {
-			var label string
-			if close.refLabel != "" {
-				label = close.refLabel
-			} else if close.refCollapsed || close.refShortcut {
-				label = innerText(inner)
-			}
-			if label != "" {
-				if ref, ok := refs[normalizeLinkLabel(label)]; ok {
-					url = ref.URL
-					title = ref.Title
-					hasTarget = true
+		if openIdx >= 0 {
+			if close.hasURL {
+				url = close.url
+				title = close.title
+				hasTarget = true
+			} else if close.hasRef && refs != nil {
+				var label string
+				if close.refLabel != "" {
+					label = close.refLabel
+				} else if close.refCollapsed || close.refShortcut {
+					label = innerText(inner)
+				}
+				if label != "" {
+					if ref, ok := refs[normalizeLinkLabel(label)]; ok {
+						url = ref.URL
+						title = ref.Title
+						hasTarget = true
+					}
 				}
 			}
 		}
 
 		if !hasTarget {
-			op.active = false
+			// On no match, if this close bracket consumed a `[label]` or
+			// `[]` reference suffix, split it back into separate bracket
+			// segments so the enclosed `[label]` can still form its own
+			// link in a later iteration.
+			if close.refLabel != "" || close.refCollapsed {
+				suffix := close.srcText
+				if len(suffix) > 0 {
+					suffix = suffix[1:] // drop leading `]`
+				}
+				close.refLabel = ""
+				close.refCollapsed = false
+				close.refShortcut = true
+				close.srcText = "]"
+				if len(suffix) > 0 {
+					extra := tokenizeInline(suffix)
+					tail := append([]*inlineSeg{}, segs[i+1:]...)
+					segs = append(segs[:i+1], append(extra, tail...)...)
+				}
+			}
+			if op != nil {
+				op.active = false
+			}
 			i++
 			continue
 		}
