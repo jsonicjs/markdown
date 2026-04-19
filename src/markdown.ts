@@ -845,6 +845,92 @@ function tokenizeInline(s: string): InlineSeg[] {
       }
     }
 
+    // Autolink / raw HTML. When `<` starts one of these patterns it's
+    // emitted as a pre-rendered html segment; otherwise it falls through
+    // to be escaped as `&lt;`.
+    if (c === '<') {
+      const rest = s.slice(i)
+
+      // Autolink URI: <scheme:path>
+      let m = rest.match(
+        /^<([a-zA-Z][a-zA-Z0-9.+-]{1,31}:[^\s<>\x00-\x1f\x7f]*)>/,
+      )
+      if (m) {
+        segs.push({
+          kind: 'html',
+          value:
+            '<a href="' +
+            encodeLinkUrl(m[1]) +
+            '">' +
+            escapeHtmlString(m[1]) +
+            '</a>',
+        })
+        i += m[0].length
+        continue
+      }
+
+      // Autolink email: <user@domain>
+      m = rest.match(
+        /^<([a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)>/,
+      )
+      if (m) {
+        segs.push({
+          kind: 'html',
+          value:
+            '<a href="mailto:' +
+            encodeLinkUrl(m[1]) +
+            '">' +
+            escapeHtmlString(m[1]) +
+            '</a>',
+        })
+        i += m[0].length
+        continue
+      }
+
+      // Raw HTML: open tag, close tag, comment, PI, declaration, CDATA.
+      m = rest.match(/^<!--(?:[^-]|-[^-]|--[^>])*?-->/)
+      if (m) {
+        segs.push({ kind: 'html', value: m[0] })
+        i += m[0].length
+        continue
+      }
+      m = rest.match(/^<\?[\s\S]*?\?>/)
+      if (m) {
+        segs.push({ kind: 'html', value: m[0] })
+        i += m[0].length
+        continue
+      }
+      m = rest.match(/^<!\[CDATA\[[\s\S]*?\]\]>/)
+      if (m) {
+        segs.push({ kind: 'html', value: m[0] })
+        i += m[0].length
+        continue
+      }
+      m = rest.match(/^<![A-Z][^>]*>/)
+      if (m) {
+        segs.push({ kind: 'html', value: m[0] })
+        i += m[0].length
+        continue
+      }
+      // Open tag with optional attributes.
+      m = rest.match(
+        /^<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:\s*=\s*(?:[^\s"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>/,
+      )
+      if (m) {
+        segs.push({ kind: 'html', value: m[0] })
+        i += m[0].length
+        continue
+      }
+      // Close tag.
+      m = rest.match(/^<\/[a-zA-Z][a-zA-Z0-9-]*\s*>/)
+      if (m) {
+        segs.push({ kind: 'html', value: m[0] })
+        i += m[0].length
+        continue
+      }
+      // Fall through: literal `<`.
+    }
+
     // Image open `![`.
     if (c === '!' && s[i + 1] === '[') {
       segs.push({

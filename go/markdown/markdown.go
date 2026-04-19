@@ -684,6 +684,26 @@ var reEntityRef = regexp.MustCompile(
 	`^&(#[xX][0-9a-fA-F]{1,6};|#[0-9]{1,7};|[a-zA-Z][a-zA-Z0-9]{1,31};)`,
 )
 
+// Inline autolink / raw HTML recognition. Patterns match the subset of
+// CommonMark §6.6–6.7 that does not require backreferences (unavailable in
+// RE2) and keeps regexes tractable.
+var (
+	reAutolinkURI = regexp.MustCompile(
+		`^<([a-zA-Z][a-zA-Z0-9.+-]{1,31}:[^\s<>\x00-\x1f\x7f]*)>`,
+	)
+	reAutolinkEmail = regexp.MustCompile(
+		`^<([a-zA-Z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)>`,
+	)
+	reHTMLComment = regexp.MustCompile(`^<!--(?s:.)*?-->`)
+	reHTMLPI      = regexp.MustCompile(`^<\?(?s:.)*?\?>`)
+	reHTMLCDATA   = regexp.MustCompile(`^<!\[CDATA\[(?s:.)*?\]\]>`)
+	reHTMLDecl    = regexp.MustCompile(`^<![A-Z][^>]*>`)
+	reHTMLOpenTag = regexp.MustCompile(
+		`^<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:\s*=\s*(?:[^\s"'=<>` + "`" + `]+|'[^']*'|"[^"]*"))?)*\s*/?>`,
+	)
+	reHTMLCloseTag = regexp.MustCompile(`^</[a-zA-Z][a-zA-Z0-9-]*\s*>`)
+)
+
 // decodeEntity returns the Unicode string for a full entity reference
 // (including the leading & and trailing ;), or empty string + ok=false
 // if the reference is not recognized. Invalid or zero-code-point numeric
@@ -1026,6 +1046,63 @@ func tokenizeInline(s string) []*inlineSeg {
 					continue
 				}
 			}
+		}
+
+		// Autolink / raw HTML. When `<` starts one of these patterns it's
+		// emitted as a pre-rendered html segment; otherwise it falls
+		// through to be escaped as `&lt;`.
+		if c == '<' {
+			rest := s[i:]
+
+			if m := reAutolinkURI.FindStringSubmatchIndex(rest); m != nil && m[0] == 0 {
+				url := rest[m[2]:m[3]]
+				segs = append(segs, &inlineSeg{
+					kind:  segHTML,
+					value: `<a href="` + encodeLinkUrl(url) + `">` + escapeHTMLString(url) + `</a>`,
+				})
+				i += m[1]
+				continue
+			}
+			if m := reAutolinkEmail.FindStringSubmatchIndex(rest); m != nil && m[0] == 0 {
+				email := rest[m[2]:m[3]]
+				segs = append(segs, &inlineSeg{
+					kind:  segHTML,
+					value: `<a href="mailto:` + encodeLinkUrl(email) + `">` + escapeHTMLString(email) + `</a>`,
+				})
+				i += m[1]
+				continue
+			}
+			if m := reHTMLComment.FindStringIndex(rest); m != nil && m[0] == 0 {
+				segs = append(segs, &inlineSeg{kind: segHTML, value: rest[:m[1]]})
+				i += m[1]
+				continue
+			}
+			if m := reHTMLPI.FindStringIndex(rest); m != nil && m[0] == 0 {
+				segs = append(segs, &inlineSeg{kind: segHTML, value: rest[:m[1]]})
+				i += m[1]
+				continue
+			}
+			if m := reHTMLCDATA.FindStringIndex(rest); m != nil && m[0] == 0 {
+				segs = append(segs, &inlineSeg{kind: segHTML, value: rest[:m[1]]})
+				i += m[1]
+				continue
+			}
+			if m := reHTMLDecl.FindStringIndex(rest); m != nil && m[0] == 0 {
+				segs = append(segs, &inlineSeg{kind: segHTML, value: rest[:m[1]]})
+				i += m[1]
+				continue
+			}
+			if m := reHTMLOpenTag.FindStringIndex(rest); m != nil && m[0] == 0 {
+				segs = append(segs, &inlineSeg{kind: segHTML, value: rest[:m[1]]})
+				i += m[1]
+				continue
+			}
+			if m := reHTMLCloseTag.FindStringIndex(rest); m != nil && m[0] == 0 {
+				segs = append(segs, &inlineSeg{kind: segHTML, value: rest[:m[1]]})
+				i += m[1]
+				continue
+			}
+			// Fall through: literal `<`.
 		}
 
 		// Image open `![`.
