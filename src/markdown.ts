@@ -314,6 +314,30 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
 }
 
 
+// computeListItem determines the effective content column and first-line
+// text for a list item. Per CommonMark § 5.2, if the marker is followed by
+// 1-4 spaces the content column is (marker_end + spaces); if 5+ spaces,
+// the content column is (marker_end + 1) and the rest of the whitespace
+// becomes part of the item's content (forming an indented code block).
+// If the content after the marker is empty/whitespace-only, the content
+// column is (marker_end + 1) regardless of trailing space count.
+function computeListItem(
+  markerEnd: number,
+  spacesAfter: number,
+  rest: string,
+): { contentCol: number; text: string } {
+  if (rest.length === 0) {
+    return { contentCol: markerEnd + 1, text: '' }
+  }
+  if (spacesAfter >= 5) {
+    return {
+      contentCol: markerEnd + 1,
+      text: ' '.repeat(spacesAfter - 1) + rest,
+    }
+  }
+  return { contentCol: markerEnd + spacesAfter, text: rest }
+}
+
 // stripIndent removes up to 3 leading spaces from a line. CommonMark allows
 // that much indentation on most block-level constructs before they count as
 // indented code.
@@ -596,13 +620,17 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       // Ordered list item. CommonMark limits the marker to 1-9 digits.
       else if (/^ {0,3}\d{1,9}[.)][ \t]/.test(lineContent)) {
         const m = lineContent.match(/^( {0,3})(\d{1,9})([.)])([ \t]+)(.*)$/)!
-        const contentCol = m[1].length + m[2].length + 1 + m[4].length
-        state.listContentCol = contentCol
+        const result = computeListItem(
+          m[1].length + m[2].length + 1,
+          m[4].length,
+          m[5],
+        )
+        state.listContentCol = result.contentCol
         const start = parseInt(m[2], 10)
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token(
           '#ML',
-          { ordered: true, text: m[5], start },
+          { ordered: true, text: result.text, start },
           srcPart,
           pnt,
         )
@@ -612,15 +640,29 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
       // Unordered list item.
       else if (/^ {0,3}[-*+][ \t]/.test(lineContent)) {
         const m = lineContent.match(/^( {0,3})([-*+])([ \t]+)(.*)$/)!
-        const contentCol = m[1].length + m[2].length + m[3].length
-        state.listContentCol = contentCol
+        const result = computeListItem(
+          m[1].length + m[2].length,
+          m[3].length,
+          m[4],
+        )
+        state.listContentCol = result.contentCol
         srcPart = src.substring(sI, consumeEnd)
-        tkn = lex.token('#ML', { ordered: false, text: m[4] }, srcPart, pnt)
+        tkn = lex.token(
+          '#ML',
+          { ordered: false, text: result.text },
+          srcPart,
+          pnt,
+        )
         kind = 'list'
       }
 
-      // Bare list marker with no content on the same line.
-      else if (/^ {0,3}[-*+][ \t]*$/.test(lineContent)) {
+      // Bare list marker with no content on the same line. Per CommonMark,
+      // an empty-content list marker cannot interrupt a paragraph, so
+      // fall through to plain text when we're currently in one.
+      else if (
+        state.last !== 'text' &&
+        /^ {0,3}[-*+][ \t]*$/.test(lineContent)
+      ) {
         const m = lineContent.match(/^( {0,3})([-*+])/)!
         state.listContentCol = m[1].length + m[2].length + 1
         srcPart = src.substring(sI, consumeEnd)
@@ -628,9 +670,12 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         kind = 'list'
       }
 
-      else if (/^ {0,3}\d{1,9}[.)][ \t]*$/.test(lineContent)) {
+      else if (
+        state.last !== 'text' &&
+        /^ {0,3}\d{1,9}[.)][ \t]*$/.test(lineContent)
+      ) {
         const m = lineContent.match(/^( {0,3})(\d{1,9})([.)])/)!
-        state.listContentCol = m[1].length + m[2].length + 2
+        state.listContentCol = m[1].length + m[2].length + 1 + 1
         const start = parseInt(m[2], 10)
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token(

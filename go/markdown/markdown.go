@@ -477,6 +477,21 @@ var (
 	reBlockquote    = regexp.MustCompile(`^ {0,3}>( ?)(.*)$`)
 )
 
+// computeListItem determines the effective content column and first-line
+// text for a list item. Per CommonMark § 5.2, if the marker is followed by
+// 1-4 spaces the content column is (marker_end + spaces); if 5+ spaces,
+// the content column is (marker_end + 1) and the rest of the whitespace
+// becomes part of the item's content (forming an indented code block).
+func computeListItem(markerEnd, spacesAfter int, rest string) (int, string) {
+	if rest == "" {
+		return markerEnd + 1, ""
+	}
+	if spacesAfter >= 5 {
+		return markerEnd + 1, strings.Repeat(" ", spacesAfter-1) + rest
+	}
+	return markerEnd + spacesAfter, rest
+}
+
 // stripIndent removes up to 3 leading spaces from a line. CommonMark allows
 // that much indentation on most block-level constructs before they count as
 // indented code.
@@ -796,12 +811,14 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			// Ordered list item.
 			case reOrderedFull.MatchString(lineContent):
 				m := reOrderedFull.FindStringSubmatch(lineContent)
-				state.listContentCol = len(m[1]) + len(m[2]) + 1 + len(m[4])
+				markerEnd := len(m[1]) + len(m[2]) + 1
+				cc, text := computeListItem(markerEnd, len(m[4]), m[5])
+				state.listContentCol = cc
 				start := 0
 				fmt.Sscanf(m[2], "%d", &start)
 				val := map[string]any{
 					"ordered": true,
-					"text":    m[5],
+					"text":    text,
 					"start":   start,
 				}
 				srcPart := src[sI:consumeEnd]
@@ -811,14 +828,17 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 			// Unordered list item.
 			case reUnorderedFull.MatchString(lineContent):
 				m := reUnorderedFull.FindStringSubmatch(lineContent)
-				state.listContentCol = len(m[1]) + len(m[2]) + len(m[3])
-				val := map[string]any{"ordered": false, "text": m[4]}
+				markerEnd := len(m[1]) + len(m[2])
+				cc, text := computeListItem(markerEnd, len(m[3]), m[4])
+				state.listContentCol = cc
+				val := map[string]any{"ordered": false, "text": text}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
 
-			// Bare list marker with no content on the same line.
-			case reUnorderedBare.MatchString(lineContent):
+			// Bare list marker with no content. Empty-content list markers
+			// cannot interrupt a paragraph (CommonMark § 5.2).
+			case state.last != "text" && reUnorderedBare.MatchString(lineContent):
 				m := reUnorderedBare.FindStringSubmatch(lineContent)
 				state.listContentCol = len(m[1]) + 2
 				val := map[string]any{"ordered": false, "text": ""}
@@ -826,7 +846,7 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 				tkn = lex.Token("#ML", tinFor(lex, "#ML"), val, srcPart)
 				kind = "list"
 
-			case reOrderedBare.MatchString(lineContent):
+			case state.last != "text" && reOrderedBare.MatchString(lineContent):
 				m := reOrderedBare.FindStringSubmatch(lineContent)
 				state.listContentCol = len(m[1]) + len(m[2]) + 2
 				start := 0
