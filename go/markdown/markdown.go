@@ -715,9 +715,13 @@ func decodeEntity(ref string) (string, bool) {
 	return "", false
 }
 
-// renderInline processes block-level text as inline markdown, currently
-// handling backslash escapes, entity/numeric references, and hard line
-// breaks. All other characters are HTML-escaped as needed.
+// renderInline processes block-level text as inline markdown. It currently
+// handles:
+//   - backslash escapes (\<punct> or \<newline>)
+//   - entity / numeric character references
+//   - hard line breaks (2+ trailing spaces before \n, or backslash before \n)
+//   - code spans (`...`, with matching-length backtick runs)
+// All other characters are HTML-escaped as needed.
 func renderInline(s string) string {
 	var b strings.Builder
 	i := 0
@@ -739,6 +743,58 @@ func renderInline(s string) string {
 				i += 2
 				continue
 			}
+		}
+
+		// Code span: a run of N backticks is closed by the next run of
+		// exactly N backticks. Content is literal, newlines collapse to
+		// spaces, and a single matching leading+trailing space is stripped
+		// when both exist and the content is not all spaces.
+		if c == '`' {
+			openLen := 1
+			for i+openLen < n && s[i+openLen] == '`' {
+				openLen++
+			}
+
+			j := i + openLen
+			found := -1
+			for j < n {
+				if s[j] == '`' {
+					closeLen := 1
+					for j+closeLen < n && s[j+closeLen] == '`' {
+						closeLen++
+					}
+					if closeLen == openLen {
+						found = j
+						break
+					}
+					j += closeLen
+				} else {
+					j++
+				}
+			}
+
+			if found >= 0 {
+				content := s[i+openLen : found]
+				content = strings.ReplaceAll(content, "\r\n", " ")
+				content = strings.ReplaceAll(content, "\n", " ")
+				content = strings.ReplaceAll(content, "\r", " ")
+				if len(content) >= 2 &&
+					content[0] == ' ' &&
+					content[len(content)-1] == ' ' &&
+					strings.IndexFunc(content, func(r rune) bool { return r != ' ' }) >= 0 {
+					content = content[1 : len(content)-1]
+				}
+				b.WriteString("<code>")
+				b.WriteString(escapeHTMLString(content))
+				b.WriteString("</code>")
+				i = found + openLen
+				continue
+			}
+
+			// No matching close: emit the backticks literally.
+			b.WriteString(strings.Repeat("`", openLen))
+			i += openLen
+			continue
 		}
 
 		// Entity or numeric character reference.

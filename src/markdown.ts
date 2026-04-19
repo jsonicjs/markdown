@@ -606,10 +606,14 @@ function decodeEntity(ref: string): string | null {
   return named === undefined ? null : named
 }
 
-// renderInline processes block-level text as inline markdown, currently
-// handling backslash escapes, entity/numeric references, and hard line
-// breaks (two+ trailing spaces before a newline, or backslash before a
-// newline). All other characters are HTML-escaped as needed.
+// renderInline processes block-level text as inline markdown. It currently
+// handles:
+//   - backslash escapes (\<punct> or \<newline>)
+//   - entity / numeric character references
+//   - hard line breaks (2+ trailing spaces before \n, or backslash before \n)
+//   - code spans (`...`, with matching-length backtick runs)
+// All other characters are HTML-escaped as needed. Inline emphasis, links,
+// and autolinks are not yet implemented.
 function renderInline(s: string): string {
   let out = ''
   let i = 0
@@ -633,6 +637,51 @@ function renderInline(s: string): string {
       }
     }
 
+    // Code span: a run of N backticks is closed by the next run of exactly
+    // N backticks. Content is literal (no inline processing), newlines
+    // collapse to spaces, and a single matching leading+trailing space is
+    // stripped when both exist and the content is not all spaces.
+    if (c === '`') {
+      let openLen = 1
+      while (i + openLen < n && s[i + openLen] === '`') openLen++
+
+      let j = i + openLen
+      let found = -1
+      while (j < n) {
+        if (s[j] === '`') {
+          let closeLen = 1
+          while (j + closeLen < n && s[j + closeLen] === '`') closeLen++
+          if (closeLen === openLen) {
+            found = j
+            break
+          }
+          j += closeLen
+        } else {
+          j++
+        }
+      }
+
+      if (found >= 0) {
+        let content = s.slice(i + openLen, found).replace(/[\r\n]+/g, ' ')
+        if (
+          content.length >= 2 &&
+          content.startsWith(' ') &&
+          content.endsWith(' ') &&
+          /[^ ]/.test(content)
+        ) {
+          content = content.slice(1, -1)
+        }
+        out += '<code>' + escapeHtmlString(content) + '</code>'
+        i = found + openLen
+        continue
+      }
+
+      // No matching close: emit the backticks literally and continue.
+      out += '`'.repeat(openLen)
+      i += openLen
+      continue
+    }
+
     // Entity or numeric character reference.
     if (c === '&') {
       const m = s
@@ -652,7 +701,6 @@ function renderInline(s: string): string {
 
     // Hard line break via 2+ trailing spaces.
     if (c === '\n') {
-      // Look back for trailing spaces.
       let trailing = 0
       while (trailing < out.length && out[out.length - 1 - trailing] === ' ') {
         trailing++
