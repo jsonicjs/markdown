@@ -115,6 +115,8 @@ const grammarText = `
 
   rule: icode-tail: open: [
     { s: '#MIC' a: '@icode-append' r: icode-tail g: 'md,icode,more' }
+    { s: ['#MB' '#MIC'] b: 1 a: '@icode-blank' r: icode-tail g: 'md,icode,blank-mic' }
+    { s: ['#MB' '#MB']  b: 1 a: '@icode-blank' r: icode-tail g: 'md,icode,blank-blank' }
     { g: 'md,icode,end' }
   ]
 }
@@ -324,12 +326,19 @@ const Markdown: Plugin = (jsonic: Jsonic, options: MarkdownOptions) => {
       if (emitHtml) block.html = renderHtml(block)
       r.node.push(block)
       ctx.u.mdCurrent = block
+      ctx.u.icodePendingBlanks = 0
     },
 
     '@icode-append': (r: Rule, ctx: Context) => {
       const v = r.o0.val as string
-      ctx.u.mdCurrent.text += '\n' + v
+      const pending = (ctx.u.icodePendingBlanks as number) || 0
+      ctx.u.mdCurrent.text += '\n'.repeat(pending + 1) + v
+      ctx.u.icodePendingBlanks = 0
       if (emitHtml) ctx.u.mdCurrent.html = renderHtml(ctx.u.mdCurrent)
+    },
+
+    '@icode-blank': (_r: Rule, ctx: Context) => {
+      ctx.u.icodePendingBlanks = ((ctx.u.icodePendingBlanks as number) || 0) + 1
     },
   }
 
@@ -570,7 +579,7 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
             tkn = lex.token('#MT', lineContent, srcPart, pnt)
             kind = 'text'
           } else {
-            const lang = infoRaw.trim().split(/\s+/)[0] || ''
+            const lang = decodeLinkText(infoRaw.trim().split(/\s+/)[0] || '')
             const codeLines: string[] = []
             let codeEnd = consumeEnd
 
@@ -614,15 +623,19 @@ function buildMarkdownLineMatcher(options: MarkdownOptions) {
         }
       }
 
-      // ATX heading: up to 3 leading spaces, 1-6 `#`, then space+text or end
-      // of line. Trailing `#` sequences preceded by whitespace are stripped.
-      else if (
-        /^ {0,3}(#{1,6})(?:[ \t]+.*?)?(?:[ \t]+#+)?[ \t]*$/.test(lineContent)
-      ) {
+      // ATX heading: up to 3 leading spaces, 1-6 `#`, optional space+text.
+      // Trailing `#` closure (preceded by space, or the whole content
+      // consisting only of `#`s) is stripped.
+      else if (/^ {0,3}(#{1,6})(?:[ \t]+.*?)?[ \t]*$/.test(lineContent)) {
         const m = lineContent.match(
-          /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/,
+          /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$/,
         )!
-        const textRaw = (m[2] ?? '').trim()
+        let textRaw = m[2] ?? ''
+        // Strip trailing `<whitespace>#+<whitespace>` closure sequence.
+        textRaw = textRaw.replace(/[ \t]+#+[ \t]*$/, '')
+        // Collapse an all-hash content to empty (e.g. `### ###`).
+        if (/^#+$/.test(textRaw)) textRaw = ''
+        textRaw = textRaw.trim()
         srcPart = src.substring(sI, consumeEnd)
         tkn = lex.token(
           '#MH',

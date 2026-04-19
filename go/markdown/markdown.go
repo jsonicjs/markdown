@@ -95,6 +95,8 @@ const grammarText = `
 
   rule: icode-tail: open: [
     { s: '#MIC' a: '@icode-append' r: icode-tail g: 'md,icode,more' }
+    { s: ['#MB' '#MIC'] b: 1 a: '@icode-blank' r: icode-tail g: 'md,icode,blank-mic' }
+    { s: ['#MB' '#MB']  b: 1 a: '@icode-blank' r: icode-tail g: 'md,icode,blank-blank' }
     { g: 'md,icode,end' }
   ]
 }
@@ -340,17 +342,27 @@ func Markdown(j *jsonic.Jsonic, options map[string]any) error {
 				block["html"] = RenderHTML(block)
 			}
 			pushBlock(r, block)
-			ensureMeta(ctx)["mdCurrent"] = block
+			meta := ensureMeta(ctx)
+			meta["mdCurrent"] = block
+			meta["icodePendingBlanks"] = 0
 		}),
 
 		"@icode-append": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			v, _ := r.O0.Val.(string)
 			cur, _ := ctx.Meta["mdCurrent"].(map[string]any)
 			text, _ := cur["text"].(string)
-			cur["text"] = text + "\n" + v
+			pending, _ := ctx.Meta["icodePendingBlanks"].(int)
+			cur["text"] = text + strings.Repeat("\n", pending+1) + v
+			ctx.Meta["icodePendingBlanks"] = 0
 			if emitHTML {
 				cur["html"] = RenderHTML(cur)
 			}
+		}),
+
+		"@icode-blank": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
+			meta := ensureMeta(ctx)
+			pending, _ := meta["icodePendingBlanks"].(int)
+			meta["icodePendingBlanks"] = pending + 1
 		}),
 	}
 
@@ -489,7 +501,9 @@ func splitParagraphs(s string) []string {
 // Pre-compiled line classification regexes.
 var (
 	reBlank         = regexp.MustCompile(`^[ \t]*$`)
-	reATX           = regexp.MustCompile(`^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$`)
+	reATX           = regexp.MustCompile(`^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$`)
+	reATXTrailHash  = regexp.MustCompile(`[ \t]+#+[ \t]*$`)
+	reATXAllHash    = regexp.MustCompile(`^#+$`)
 	reSetext        = regexp.MustCompile(`^ {0,3}(=+|-+)[ \t]*$`)
 	reOrderedFull   = regexp.MustCompile(`^( {0,3})(\d{1,9})([.)])([ \t]+)(.*)$`)
 	reUnorderedFull = regexp.MustCompile(`^( {0,3})([-*+])([ \t]+)(.*)$`)
@@ -754,6 +768,7 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 					if idx := strings.IndexAny(lang, " \t"); idx >= 0 {
 						lang = lang[:idx]
 					}
+					lang = decodeLinkText(lang)
 					codeLines := []string{}
 					codeEnd := consumeEnd
 
@@ -802,11 +817,16 @@ func buildMarkdownLineMatcher(fence string) jsonic.MakeLexMatcher {
 					kind = "code"
 				}
 
-			// ATX heading: 0-3 leading spaces, 1-6 `#`, optional space+text,
-			// optional trailing `#` sequence preceded by whitespace.
+			// ATX heading: 0-3 leading spaces, 1-6 `#`, optional space+text.
+			// Trailing `#` closure is stripped.
 			case reATX.MatchString(lineContent):
 				m := reATX.FindStringSubmatch(lineContent)
-				text := strings.TrimSpace(m[2])
+				text := m[2]
+				text = reATXTrailHash.ReplaceAllString(text, "")
+				if reATXAllHash.MatchString(text) {
+					text = ""
+				}
+				text = strings.TrimSpace(text)
 				val := map[string]any{"level": len(m[1]), "text": text}
 				srcPart := src[sI:consumeEnd]
 				tkn = lex.Token("#MH", tinFor(lex, "#MH"), val, srcPart)

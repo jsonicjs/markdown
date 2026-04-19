@@ -76,6 +76,8 @@
 
   rule: icode-tail: open: [
     { s: '#MIC' a: '@icode-append' r: icode-tail g: 'md,icode,more' }
+    { s: ['#MB' '#MIC'] b: 1 a: '@icode-blank' r: icode-tail g: 'md,icode,blank-mic' }
+    { s: ['#MB' '#MB']  b: 1 a: '@icode-blank' r: icode-tail g: 'md,icode,blank-blank' }
     { g: 'md,icode,end' }
   ]
 }
