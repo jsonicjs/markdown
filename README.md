@@ -1,9 +1,9 @@
 # @jsonic/csv
 
-A [Jsonic](https://jsonic.senecajs.org) syntax plugin that parses
-CSV text into objects or arrays, with support for headers, quoted
-fields, custom delimiters, streaming, and strict/non-strict modes.
-Available for TypeScript and Go.
+A collection of [Jsonic](https://jsonic.senecajs.org) syntax plugins
+that parse **CSV** and **CommonMark markdown** into structured data.
+Available for both TypeScript and Go, and passes the full CommonMark
+0.31.2 conformance suite (652/652 examples).
 
 
 [![npm version](https://img.shields.io/npm/v/@jsonic/csv.svg)](https://npmjs.com/package/@jsonic/csv)
@@ -17,7 +17,7 @@ Available for TypeScript and Go.
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------- |
 
 
-## Quick example
+## Quick example — CSV
 
 **TypeScript**
 
@@ -29,9 +29,6 @@ const parse = Jsonic.make().use(Csv)
 
 parse("name,age\nAlice,30\nBob,25")
 // [{ name: 'Alice', age: '30' }, { name: 'Bob', age: '25' }]
-
-parse('a,b\n1,"hello, world"')
-// [{ a: '1', b: 'hello, world' }]
 ```
 
 **Go**
@@ -44,13 +41,42 @@ result, _ := csv.Parse("name,age\nAlice,30\nBob,25")
 ```
 
 
+## Quick example — Markdown
+
+**TypeScript**
+
+```typescript
+import { Jsonic } from 'jsonic'
+import { Markdown, toHtml } from '@jsonic/csv/dist/markdown'
+
+const parseMd = Jsonic.make().use(Markdown, { html: true })
+console.log(toHtml(parseMd('# Hello\n\nworld')))
+// <h1>Hello</h1>
+// <p>world</p>
+```
+
+**Go**
+
+```go
+import (
+  jsonic "github.com/jsonicjs/jsonic/go"
+  markdown "github.com/jsonicjs/csv/go/markdown"
+)
+
+j := jsonic.Make()
+j.UseDefaults(markdown.Markdown, markdown.Defaults, map[string]any{"html": true})
+r, _ := j.Parse("# Hello\n\nworld")
+fmt.Println(markdown.ToHTML(r.([]any)))
+```
+
+
 ## Documentation
 
 Full documentation following the [Diataxis](https://diataxis.fr)
 framework (tutorials, how-to guides, explanation, reference):
 
-- [TypeScript documentation](doc/csv-ts.md)
-- [Go documentation](doc/csv-go.md)
+- CSV plugin — [TypeScript](doc/csv-ts.md) · [Go](doc/csv-go.md)
+- Markdown plugin — [TypeScript](doc/markdown-ts.md) · [Go](doc/markdown-go.md)
 
 
 ## License

@@ -8,58 +8,131 @@ delimiters, streaming, and strict/non-strict modes.
 go get github.com/jsonicjs/csv/go@latest
 ```
 
+This documentation follows the [Diataxis](https://diataxis.fr)
+framework: a **tutorial** for first-time users, **how-to guides**
+for specific tasks, **explanation** of key concepts, and a complete
+**reference**.
 
-## Tutorials
 
-### Parse a basic CSV file
+## Tutorial: load, filter and stream a sales CSV
 
-Parse CSV text with a header row into a slice of ordered maps:
+This tutorial walks you through using `jsonicjs/csv/go` end-to-end:
+you will parse a small sales file, enable strict typing for the
+numeric columns, reshape the data, and finally re-parse it as a
+stream so that nothing is held in memory.
+
+Create a new project:
+
+```bash
+mkdir csv-tutorial && cd csv-tutorial
+go mod init csv-tutorial
+go get github.com/jsonicjs/csv/go@latest
+```
+
+### Step 1 — parse a file with a header row
+
+Create `sales.csv`:
+
+```
+region,product,units,revenue
+EU,widget,12,240.00
+US,gadget, 7,189.50
+US,widget,20,400.00
+```
+
+Create `main.go`:
 
 ```go
 package main
 
 import (
     "fmt"
+    "os"
+
     csv "github.com/jsonicjs/csv/go"
 )
 
 func main() {
-    result, _ := csv.Parse("name,age\nAlice,30\nBob,25")
-    fmt.Println(result)
-    // [{name:Alice age:30} {name:Bob age:25}]
+    data, _ := os.ReadFile("sales.csv")
+    rows, _ := csv.Parse(string(data))
+    fmt.Printf("%+v\n", rows[0])
+    // map[region:EU product:widget units:12 revenue:240.00]
 }
 ```
 
-### Parse CSV without headers
+Every field is a string. That's the default: a CSV parser should
+not silently turn `"12"` into a number, because a column of US ZIP
+codes would lose its leading zeroes.
 
-Return rows as slices instead of maps, with no header row:
+### Step 2 — turn numbers on for real
+
+For this data set we DO want numbers. Opt in with `Number` and tidy
+up padding with `Trim`:
 
 ```go
-result, _ := csv.Parse("a,b,c\n1,2,3", csv.CsvOptions{
-    Header: boolPtr(false),
-    Object: boolPtr(false),
+rows, _ := csv.Parse(string(data), csv.CsvOptions{
+    Number: boolPtr(true),
+    Trim:   boolPtr(true),
 })
-// [[a b c] [1 2 3]]
+
+fmt.Printf("%+v\n", rows[1])
+// map[region:US product:gadget units:7 revenue:189.5]
+
+// Option-pointer helper used throughout the API.
+func boolPtr(b bool) *bool { return &b }
 ```
 
-### Parse CSV with quoted fields
+`units` and `revenue` are now Go numeric values; `region` and
+`product` stay strings because they don't look numeric.
 
-Double-quoted fields handle commas, newlines, and escaped quotes:
+### Step 3 — aggregate the rows
+
+At this point `rows` is a plain `[]any` of `map[string]any`, so any
+regular Go works:
 
 ```go
-result, _ := csv.Parse(`name,bio
-Alice,"Likes ""cats"" and dogs"
-Bob,"Line1
-Line2"`)
-// [{name:Alice bio:Likes "cats" and dogs} {name:Bob bio:Line1\nLine2}]
+totals := map[string]float64{}
+for _, row := range rows {
+    r := row.(map[string]any)
+    totals[r["region"].(string)] += r["revenue"].(float64)
+}
+fmt.Println(totals) // map[EU:240 US:589.5]
 ```
+
+### Step 4 — stream instead of materialise
+
+For a million-row file you don't want the whole slice in memory.
+Supply a `Stream` callback; the plugin invokes it once per record
+and returns an empty slice at the end:
+
+```go
+var total float64
+
+csv.Parse(string(data), csv.CsvOptions{
+    Number: boolPtr(true),
+    Trim:   boolPtr(true),
+    Stream: func(what string, record any) {
+        if what == "record" {
+            if r, ok := record.(map[string]any); ok {
+                total += r["revenue"].(float64)
+            }
+        }
+    },
+})
+
+fmt.Println(total) // 829.5
+```
+
+That's it — you've parsed, typed, aggregated, and streamed a CSV
+file. The rest of this document is organised so you can drop in to
+answer a specific question without re-reading the whole tutorial.
 
 
 ## How-to guides
 
-### Use a custom field delimiter
+Short, task-focused recipes.
 
-Set `Field.Separation` to use a delimiter other than comma:
+### Use a custom field delimiter
 
 ```go
 result, _ := csv.Parse("name\tage\nAlice\t30", csv.CsvOptions{
@@ -69,9 +142,6 @@ result, _ := csv.Parse("name\tage\nAlice\t30", csv.CsvOptions{
 ```
 
 ### Enable number and value parsing
-
-By default in strict mode, all values are strings. Enable `Number`
-and `Value` to parse numeric and boolean values:
 
 ```go
 result, _ := csv.Parse("a,b,c\n1,true,null", csv.CsvOptions{
@@ -83,9 +153,6 @@ result, _ := csv.Parse("a,b,c\n1,true,null", csv.CsvOptions{
 
 ### Trim whitespace from fields
 
-Enable `Trim` to remove leading and trailing whitespace from field
-values:
-
 ```go
 result, _ := csv.Parse("a , b \n 1 , 2 ", csv.CsvOptions{
     Trim: boolPtr(true),
@@ -93,28 +160,17 @@ result, _ := csv.Parse("a , b \n 1 , 2 ", csv.CsvOptions{
 // [{a:1 b:2}]
 ```
 
-### Stream records as they are parsed
-
-Use the `Stream` callback to receive records one at a time:
+### Parse CSV without headers
 
 ```go
-var records []any
-
-result, _ := csv.Parse("a,b\n1,2\n3,4", csv.CsvOptions{
-    Stream: func(what string, record any) {
-        if what == "record" {
-            records = append(records, record)
-        }
-    },
+result, _ := csv.Parse("a,b,c\n1,2,3", csv.CsvOptions{
+    Header: boolPtr(false),
+    Object: boolPtr(false),
 })
-// result is [] (empty, records were streamed)
-// records contains [{a:1 b:2}, {a:3 b:4}]
+// [[a b c] [1 2 3]]
 ```
 
 ### Provide explicit field names
-
-Set `Field.Names` when the CSV has no header row but you want
-map output with named fields:
 
 ```go
 result, _ := csv.Parse("1,2,3\n4,5,6", csv.CsvOptions{
@@ -126,9 +182,6 @@ result, _ := csv.Parse("1,2,3\n4,5,6", csv.CsvOptions{
 
 ### Enforce exact field counts
 
-Set `Field.Exact` to error when a row has more or fewer fields
-than the header:
-
 ```go
 _, err := csv.Parse("a,b\n1,2,3", csv.CsvOptions{
     Field: &csv.FieldOptions{Exact: true},
@@ -136,10 +189,26 @@ _, err := csv.Parse("a,b\n1,2,3", csv.CsvOptions{
 // err: unexpected extra field value
 ```
 
+### Stream records as they are parsed
+
+```go
+var records []any
+
+csv.Parse("a,b\n1,2\n3,4", csv.CsvOptions{
+    Stream: func(what string, record any) {
+        if what == "record" {
+            records = append(records, record)
+        }
+    },
+})
+// records contains [{a:1 b:2}, {a:3 b:4}]
+```
+
 ### Create a reusable parser
 
 Use `MakeJsonic` to create a configured Jsonic instance you can
-call repeatedly:
+call repeatedly — this avoids re-running plugin setup for each
+document:
 
 ```go
 j := csv.MakeJsonic(csv.CsvOptions{
@@ -150,9 +219,7 @@ r1, _ := j.Parse("a,b\n1,2")
 r2, _ := j.Parse("x,y\n3,4")
 ```
 
-### Enable comment lines
-
-Enable `Comment` to skip lines starting with `#`:
+### Enable `#` comment lines
 
 ```go
 result, _ := csv.Parse("a,b\n# skip\n1,2", csv.CsvOptions{
@@ -164,31 +231,55 @@ result, _ := csv.Parse("a,b\n# skip\n1,2", csv.CsvOptions{
 
 ## Explanation
 
+Context and design notes.
+
 ### Strict vs non-strict mode
 
-In **strict mode** (default), the CSV plugin disables Jsonic's
-built-in JSON parsing. All field values are treated as raw strings
-unless `Number` or `Value` options are enabled. This matches the
-behaviour of standard CSV parsers.
+CSV is not a single format. Real-world files range from strict
+RFC 4180 comma-separated strings to ad-hoc files with comments,
+type coercion, trimmed whitespace, and embedded JSON blobs. The
+plugin handles both ends of the spectrum with a single switch:
 
-In **non-strict mode** (`Strict: boolPtr(false)`), the plugin
-preserves Jsonic's ability to parse JSON values. Fields can contain
-objects, arrays, booleans, numbers, and quoted strings using Jsonic
-syntax. Non-strict mode enables `Trim`, `Comment`, and `Number` by
-default.
+- In **strict mode** (default), Jsonic's built-in JSON parsing is
+  disabled. All field values are raw strings unless you opt in with
+  `Number` or `Value`. This matches standard CSV libraries.
+- In **non-strict mode** (`Strict: boolPtr(false)`), Jsonic syntax
+  is preserved. Fields can be objects, arrays, booleans, numbers,
+  or quoted strings. Non-strict mode also turns `Trim`, `Comment`,
+  and `Number` on by default because those features usually go
+  together when you're writing CSV "by hand".
+
+### Why the options are pointers
+
+Most `CsvOptions` fields are `*bool` because the plugin needs to
+distinguish "caller didn't set this" (use the strict-mode default)
+from "caller explicitly set it to false". A plain `bool` cannot
+represent three states — only `nil`, `*true`, and `*false` can.
+The `boolPtr` helper in the tutorial keeps call sites readable.
 
 ### How quoted fields work
 
 The plugin includes a custom CSV string matcher that handles the
 RFC 4180 double-quote escaping convention:
 
-- A field wrapped in double quotes can contain commas, newlines,
-  and quotes.
-- A literal quote inside a quoted field is represented as `""`.
-- For example: `"a""b"` parses to `a"b`.
+- A field wrapped in `"..."` can contain commas, newlines, and
+  quotes.
+- A literal quote inside a quoted field is written `""`.
+- `"a""b"` parses to `a"b`.
+
+### The streaming model
+
+Jsonic parsing is synchronous, so "streaming" here means *don't
+retain records in the returned slice*. When a `Stream` callback is
+supplied, the plugin hands each parsed record to it as soon as it's
+complete, then discards it. The returned slice is empty — use the
+callback for all record handling. The callback is invoked with one
+of: `"start"`, `"record"`, `"end"`, or `"error"`.
 
 
 ## Reference
+
+Authoritative description of every exported symbol.
 
 ### `Parse` (Function)
 
@@ -260,5 +351,5 @@ type StringOptions struct {
 type StreamFunc func(what string, record any)
 ```
 
-Callback for streaming CSV parsing. Called with `"start"`, `"record"`,
-`"end"`, or `"error"`.
+Callback for streaming CSV parsing. Called with `"start"`,
+`"record"`, `"end"`, or `"error"`.
