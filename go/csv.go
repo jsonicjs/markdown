@@ -441,7 +441,7 @@ func Csv(j *jsonic.Jsonic, options map[string]any) error {
 	ZZ := j.Token("#ZZ")
 	VAL := j.TokenSet("VAL")
 
-	j.Rule("list", func(rs *jsonic.RuleSpec) {
+	j.Rule("list", func(rs *jsonic.RuleSpec, _ *jsonic.Parser) {
 		rs.Clear()
 		rs.AddBO(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			r.Node = make([]any, 0)
@@ -456,7 +456,7 @@ func Csv(j *jsonic.Jsonic, options map[string]any) error {
 		}
 	})
 
-	j.Rule("elem", func(rs *jsonic.RuleSpec) {
+	j.Rule("elem", func(rs *jsonic.RuleSpec, _ *jsonic.Parser) {
 		rs.Clear()
 		rs.Open = []*jsonic.AltSpec{
 			{S: [][]jsonic.Tin{{CA}}, B: 1,
@@ -498,7 +498,7 @@ func Csv(j *jsonic.Jsonic, options map[string]any) error {
 		})
 	})
 
-	j.Rule("val", func(rs *jsonic.RuleSpec) {
+	j.Rule("val", func(rs *jsonic.RuleSpec, _ *jsonic.Parser) {
 		rs.Clear()
 		rs.AddBO(func(r *jsonic.Rule, ctx *jsonic.Context) {
 			r.Node = jsonic.Undefined
@@ -515,7 +515,7 @@ func Csv(j *jsonic.Jsonic, options map[string]any) error {
 					if r.OS == 0 {
 						r.Node = jsonic.Undefined
 					} else {
-						r.Node = r.O0.ResolveVal()
+						r.Node = r.O0.ResolveVal(r, ctx)
 					}
 				} else {
 					r.Node = r.Child.Node

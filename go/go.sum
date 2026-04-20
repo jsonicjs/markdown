@@ -1,2 +1,4 @@
 github.com/jsonicjs/jsonic/go v0.1.18 h1:OW15hjFisrw2n7HE6zDuQAikW8A5NUW8OyP4SCG2oFg=
 github.com/jsonicjs/jsonic/go v0.1.18/go.mod h1:ObNKlCG7esWoi4AHCpdgkILvPINV8bpvkbCd4llGGUg=
+github.com/jsonicjs/jsonic/go v0.1.19 h1:jEP+GSxMGKV+eTJEjuU0qRMUQ8GAIl1SRigc+mbZzVo=
+github.com/jsonicjs/jsonic/go v0.1.19/go.mod h1:ObNKlCG7esWoi4AHCpdgkILvPINV8bpvkbCd4llGGUg=

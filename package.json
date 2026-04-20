@@ -41,6 +41,7 @@
   "devDependencies": {
     "@types/node": "^25.6.0",
     "csv-spectrum": "^2.0.0",
+    "jsonic": "^2.25.1",
     "typescript": "^5.9.3"
   },
   "peerDependencies": {
